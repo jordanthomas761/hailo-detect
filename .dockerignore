@@ -1,0 +1,17 @@
+.git
+.github
+.claude
+.venv
+venv
+__pycache__
+**/__pycache__
+*.py[cod]
+tests
+build
+dist
+*.egg-info
+.pytest_cache
+.ruff_cache
+*.hef
+hailort.log
+.DS_Store

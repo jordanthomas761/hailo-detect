@@ -1,0 +1,112 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# The runners are pods on two Raspberry Pis. A superseded run is not worth the
+# node time, and an arm64 image build is not cheap on this hardware.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: registry.jordanthomas.site
+  IMAGE_NAME: hailo-detect
+
+jobs:
+  check:
+    # The repo-scoped ARC scale set, to be added to homelab-infra as
+    # apps/arc-runners-hailo-detect/application.yaml. This label is that
+    # chart's runnerScaleSetName -- the two must be changed together.
+    runs-on: hailo-detect-runner
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # HailoRT's bindings are not on PyPI and only exist inside the image, so
+      # nothing here imports them. hailo_detect.engine degrades to an error
+      # string when hailo_platform is missing, which is what makes the rest of
+      # the package -- the letterbox maths, the NMS decode, the routes --
+      # testable on a runner with no accelerator attached.
+      - name: Install
+        run: pip install --disable-pip-version-check -e '.[dev]'
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: pytest -q
+
+  image:
+    needs: check
+    # Only main publishes. A PR gets the lint and tests above; it does not get
+    # to push a tag into the registry.
+    if: github.event_name != 'pull_request'
+    runs-on: hailo-detect-runner
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          echo "sha=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Anonymous pull, authenticated push -- see apps/registry/README.md in
+      # homelab-infra. The credentials are the zot htpasswd account.
+      - name: Log in to the registry
+        run: |
+          printf '%s' '${{ secrets.REGISTRY_PASSWORD }}' \
+            | docker login "$REGISTRY" \
+                --username '${{ secrets.REGISTRY_USERNAME }}' \
+                --password-stdin
+
+      - name: Build
+        env:
+          DOCKER_BUILDKIT: "1"
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.sha }}
+        run: |
+          docker build \
+            --tag "$IMAGE" \
+            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            .
+
+      # No :latest and no branch tag on purpose: policy/workloads.rego over in
+      # homelab-infra rejects both, and a floating tag would leave Argo with
+      # nothing to roll back to.
+      - name: Push
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.sha }}
+        run: docker push "$IMAGE"
+
+      - name: Log out
+        if: always()
+        run: docker logout "$REGISTRY" || true
+
+      # The seam between this repo and homelab-infra is one image reference.
+      # Print it where it can be copied straight into the Deployment.
+      - name: Summary
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.sha }}
+        run: |
+          {
+            echo "### Pushed"
+            echo
+            echo '```'
+            echo "image: $IMAGE"
+            echo '```'
+            echo
+            echo "Set this on \`apps/hailo-detect/manifests/deployment.yaml\` in homelab-infra."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,6 @@
+# The self-hosted runner label is the runnerScaleSetName of this repo's ARC
+# scale set in homelab-infra (apps/arc-runners-hailo-detect). actionlint
+# cannot discover it, so it is declared here.
+self-hosted-runner:
+  labels:
+    - hailo-detect-runner
