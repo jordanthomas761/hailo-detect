@@ -23,6 +23,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest==9.0.1",
+  # fastapi.testclient is a re-export of starlette's, which imports httpx at
+  # module scope and raises if it is missing. FastAPI does not depend on it,
+  # so it has to be declared here or the app tests fail at collection.
+  "httpx==0.28.1",
   "ruff==0.15.1",
 ]
 
