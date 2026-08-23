@@ -55,6 +55,21 @@ def test_drops_low_scores_and_zero_padding():
     assert [d.label for d in detections] == ["person"]
 
 
+def test_drops_boxes_degenerate_in_either_axis():
+    # Zero width but a perfectly good height, and vice versa. Neither encloses
+    # anything, and clamping would turn both into plausible-looking slivers.
+    zero_width = [0.1, 0.5, 0.9, 0.5, 0.8]
+    zero_height = [0.5, 0.1, 0.5, 0.9, 0.8]
+
+    detections = decode_nms(
+        dense_output({0: [zero_width], 16: [zero_height]}),
+        score_threshold=0.1,
+        max_detections=10,
+    )
+
+    assert detections == []
+
+
 def test_orders_by_score_and_truncates():
     boxes = {i: [[0.1, 0.1, 0.5, 0.5, 0.5 + i / 100]] for i in range(6)}
 

@@ -86,8 +86,14 @@ class HailoEngine:
         rather than a 503 on the first request.
         """
         self._thread.start()
-        if not self._ready.wait(timeout) and self.error is None:
-            self._set_error(f"device did not become ready within {timeout:.0f}s")
+        if self._ready.wait(timeout):
+            return
+        # Giving up waiting is not proof of failure: the worker may set the
+        # event moments later. _note_timeout drops the error if that has
+        # already happened, and the worker clears a stale one if it happens
+        # next -- both sides mutate the pair under the same lock, so either
+        # ordering ends with the engine reflecting the device.
+        self._note_timeout(f"device did not become ready within {timeout:.0f}s")
 
     def close(self) -> None:
         self._stopping.set()
@@ -139,7 +145,17 @@ class HailoEngine:
     def _set_error(self, message: str) -> None:
         with self._lock:
             self._error = message
-        self._ready.set()  # unblock start(); `ready` still reads False
+            # Unblocks start(); `ready` still reads False because _error is
+            # set. Both are written under the lock so no one observes half.
+            self._ready.set()
+
+    def _note_timeout(self, message: str) -> None:
+        """Record a startup timeout, unless the device opened in the meantime."""
+        with self._lock:
+            if self._ready.is_set():
+                return
+            self._error = message
+            self._ready.set()
 
     # -- inference ---------------------------------------------------------
 
@@ -216,7 +232,11 @@ class HailoEngine:
                 hpf.InferVStreams(network_group, input_params, output_params) as pipeline,
                 network_group.activate(network_group_params),
             ):
-                self._ready.set()
+                with self._lock:
+                    # The device is open, so any error start() recorded while
+                    # it was still opening is stale.
+                    self._error = None
+                    self._ready.set()
                 self._loop(pipeline, input_info.name, output_info.name, (height, width))
 
     def _loop(

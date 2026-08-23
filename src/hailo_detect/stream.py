@@ -260,6 +260,10 @@ class RtspWorker:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             process.kill()
+            # Reap it. Without this the child stays a zombie holding its pipes
+            # open, and the stderr read in _stream_once blocks on a writer
+            # that will never close.
+            process.wait(timeout=5)
 
     # -- processor ---------------------------------------------------------
 

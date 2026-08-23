@@ -173,6 +173,18 @@ def test_inference_timeout_is_a_gateway_timeout(client):
     assert upload(client).status_code == 504
 
 
+def test_index_404s_when_the_ui_assets_are_missing(monkeypatch, engines, tmp_path):
+    # The static mount is conditional, so `/` has to be too -- a build without
+    # the package data should say so rather than raise on every request.
+    monkeypatch.setattr(app_module, "STATIC_DIR", tmp_path / "absent")
+
+    with TestClient(app_module.create_app(Settings())) as test_client:
+        response = test_client.get("/")
+
+    assert response.status_code == 404
+    assert "UI assets" in response.json()["detail"]
+
+
 def test_stream_endpoints_404_without_an_rtsp_url(client):
     assert client.get("/api/stream/snapshot.jpg").status_code == 404
     assert client.get("/api/status").json()["stream"] == {"enabled": False}

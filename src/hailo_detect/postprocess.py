@@ -112,8 +112,10 @@ def decode_nms(
         for row in rows:
             y0, x0, y1, x1, score = (float(v) for v in row[:_BOX_COLUMNS])
             # A dense (classes, max_det, 5) output pads unused slots with
-            # zeros, and those decode to a zero-area box at the origin.
-            if score < score_threshold or (x1 <= x0 and y1 <= y0):
+            # zeros, and those decode to a zero-area box at the origin. `or`,
+            # not `and`: a box degenerate in one axis has no area either, and
+            # clamping it would turn it into a plausible-looking sliver.
+            if score < score_threshold or x1 <= x0 or y1 <= y0:
                 continue
             detections.append(
                 Detection(

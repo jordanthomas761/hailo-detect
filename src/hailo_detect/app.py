@@ -146,7 +146,13 @@ async def _detect_upload(
 def _register_routes(app: FastAPI) -> None:
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html")
+        # Mirrors the conditional mount above: if the package was built
+        # without its static assets, say so plainly rather than raising from
+        # inside FileResponse on every request to the root.
+        page = STATIC_DIR / "index.html"
+        if not page.is_file():
+            raise HTTPException(status_code=404, detail="UI assets are not present in this build")
+        return FileResponse(page)
 
     @app.get("/healthz", include_in_schema=False)
     async def healthz() -> dict[str, str]:
