@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# HailoRT writes this next to the process when it can't reach its log dir.
+hailort.log
+
+# Model binaries are pulled at build time from the hailo-models package,
+# not committed -- they are tens of MB each.
+*.hef
+
+.DS_Store
