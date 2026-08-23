@@ -186,11 +186,11 @@ jobs:
           fi
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
-      - name: Open the bump PR
+      - name: Push the bump branch
+        id: branch
         if: steps.bump.outputs.changed
         working-directory: infra
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           IMAGE_TAG: ${{ needs.image.outputs.tag }}
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
         run: |
@@ -205,33 +205,56 @@ jobs:
           # the same commit lands on the same branch rather than opening a
           # second PR for an identical change.
           branch="bump/hailo-detect-${IMAGE_TAG}"
-          url="$(gh pr list --head "$branch" --state open --json url --jq '.[0].url // empty')"
+          git switch -c "$branch"
+          git commit -qam "Deploy hailo-detect ${IMAGE_TAG}"
+          # --force is deliberate and safe: this branch is machine-owned, named
+          # after the tag, and its content is fully determined by that tag, so
+          # the only thing it can overwrite is an identical edit from an
+          # earlier run of this same job.
+          git push -q --force origin "$branch"
+          echo "name=$branch" >> "$GITHUB_OUTPUT"
 
-          if [ -n "$url" ]; then
-            echo "::notice::already open: $url"
-          else
-            git switch -c "$branch"
-            git commit -qam "Deploy hailo-detect ${IMAGE_TAG}"
-            # --force is deliberate and safe: this branch is machine-owned,
-            # named after the tag, and its content is fully determined by that
-            # tag, so the only thing it can overwrite is an identical edit from
-            # an earlier run of this same job.
-            git push -q --force origin "$branch"
+      # github-script rather than the gh CLI: gh is not installed in the ARC
+      # runner image (it is a GitHub-hosted-runner convenience), and this needs
+      # no binary beyond the node the action runtime already provides.
+      # renovate.yml here uses the same action for its API call.
+      - name: Open the bump PR
+        if: steps.bump.outputs.changed
+        uses: actions/github-script@v7
+        env:
+          IMAGE_TAG: ${{ needs.image.outputs.tag }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const [owner, repo] = process.env.INFRA_REPO.split("/");
+            const head = process.env.BRANCH;
+            const image = `${process.env.REGISTRY}/${process.env.IMAGE_NAME}:${process.env.IMAGE_TAG}`;
 
-            body="$(printf '%s\n' \
-              "Image built from \`${GITHUB_REPOSITORY}@${GITHUB_SHA}\`:" \
-              "" \
-              "\`${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}\`" \
-              "" \
-              "Opened by that repo's ci workflow. Merged by automerge.yml here once validate passes.")"
+            const open = await github.rest.pulls.list({
+              owner, repo, state: "open", head: `${owner}:${head}`,
+            });
 
-            url="$(gh pr create --base main --head "$branch" \
-              --title "Deploy hailo-detect ${IMAGE_TAG}" --body "$body")"
-          fi
+            let url = open.data[0]?.html_url;
+            if (url) {
+              core.info(`already open: ${url}`);
+            } else {
+              const created = await github.rest.pulls.create({
+                owner, repo, base: "main", head,
+                title: `Deploy hailo-detect ${process.env.IMAGE_TAG}`,
+                body: [
+                  `Image built from \`${context.repo.owner}/${context.repo.repo}@${context.sha}\`:`,
+                  "",
+                  `\`${image}\``,
+                  "",
+                  "Opened by that repo's ci workflow. Merged by automerge.yml here once validate passes.",
+                ].join("\n"),
+              });
+              url = created.data.html_url;
+            }
 
-          echo "::notice::$url"
-          {
-            echo "### Deploying"
-            echo
-            echo "\`${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}\` -> $url"
-          } >> "$GITHUB_STEP_SUMMARY"
+            core.notice(url);
+            await core.summary
+              .addHeading("Deploying", 3)
+              .addRaw(`\`${image}\` -> ${url}`)
+              .write();
