@@ -4,6 +4,15 @@ __pycache__/
 venv/
 .env
 
+# setuptools leaves these behind whenever a wheel is built out of the tree
+# (pip install ., pip wheel .) -- the container build does that in its own
+# stage, so nothing here needs them.
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
 # HailoRT writes this next to the process when it can't reach its log dir.
 hailort.log
 

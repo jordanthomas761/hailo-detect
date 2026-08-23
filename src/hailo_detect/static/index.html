@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>hailo-detect</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>&#128065;</text></svg>"
+    />
+  </head>
+  <body>
+    <header>
+      <h1>hailo-detect</h1>
+      <div id="device-pill" class="pill pill-unknown">checking device…</div>
+    </header>
+
+    <main>
+      <section class="card">
+        <h2>Detect in an image</h2>
+        <form id="upload-form">
+          <label class="dropzone" id="dropzone">
+            <input type="file" id="file-input" accept="image/*" hidden />
+            <span id="dropzone-label">Choose an image, or drop one here</span>
+          </label>
+          <button type="submit" id="detect-button" disabled>Detect</button>
+        </form>
+        <p class="error" id="upload-error" hidden></p>
+        <figure id="upload-result" hidden>
+          <img id="upload-image" alt="Detection result" />
+          <figcaption id="upload-caption"></figcaption>
+        </figure>
+        <ul class="detections" id="upload-detections"></ul>
+      </section>
+
+      <section class="card" id="stream-card">
+        <h2>Live stream</h2>
+        <p class="muted" id="stream-note">checking…</p>
+        <img id="stream-image" alt="Live detection stream" hidden />
+        <ul class="detections" id="stream-detections"></ul>
+      </section>
+    </main>
+
+    <footer>
+      <span id="footer-model">—</span>
+      <a href="/docs">API docs</a>
+    </footer>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

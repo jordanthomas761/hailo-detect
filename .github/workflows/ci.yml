@@ -1,0 +1,237 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# The runners are pods on two Raspberry Pis. A superseded run is not worth the
+# node time, and an arm64 image build is not cheap on this hardware.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: registry.jordanthomas.site
+  IMAGE_NAME: hailo-detect
+
+jobs:
+  check:
+    # The repo-scoped ARC scale set, to be added to homelab-infra as
+    # apps/arc-runners-hailo-detect/application.yaml. This label is that
+    # chart's runnerScaleSetName -- the two must be changed together.
+    runs-on: hailo-detect-runner
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # HailoRT's bindings are not on PyPI and only exist inside the image, so
+      # nothing here imports them. hailo_detect.engine degrades to an error
+      # string when hailo_platform is missing, which is what makes the rest of
+      # the package -- the letterbox maths, the NMS decode, the routes --
+      # testable on a runner with no accelerator attached.
+      - name: Install
+        run: pip install --disable-pip-version-check -e '.[dev]'
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: pytest -q
+
+  image:
+    needs: check
+    # Only main publishes. A PR gets the lint and tests above; it does not get
+    # to push a tag into the registry.
+    if: github.event_name != 'pull_request'
+    runs-on: hailo-detect-runner
+    outputs:
+      tag: ${{ steps.tag.outputs.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          echo "sha=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Anonymous pull, authenticated push -- see apps/registry/README.md in
+      # homelab-infra. The credentials are the zot htpasswd account.
+      - name: Log in to the registry
+        run: |
+          printf '%s' '${{ secrets.REGISTRY_PASSWORD }}' \
+            | docker login "$REGISTRY" \
+                --username '${{ secrets.REGISTRY_USERNAME }}' \
+                --password-stdin
+
+      - name: Build
+        env:
+          DOCKER_BUILDKIT: "1"
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.sha }}
+        run: |
+          docker build \
+            --tag "$IMAGE" \
+            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            .
+
+      # No :latest and no branch tag on purpose: policy/workloads.rego over in
+      # homelab-infra rejects both, and a floating tag would leave Argo with
+      # nothing to roll back to.
+      - name: Push
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.sha }}
+        run: docker push "$IMAGE"
+
+      - name: Log out
+        if: always()
+        run: docker logout "$REGISTRY" || true
+
+      # The seam between this repo and homelab-infra is one image reference.
+      # Print it where it can be copied straight into the Deployment.
+      - name: Summary
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.sha }}
+        run: |
+          {
+            echo "### Pushed"
+            echo
+            echo '```'
+            echo "image: $IMAGE"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Opens the image-tag bump in homelab-infra. That repo's automerge workflow
+  # merges it once its validate passes, and Argo syncs from there -- so a merge
+  # to main here ends with the new image running on the Pi, with the manifest
+  # change reviewable in git rather than applied out of band.
+  release:
+    needs: image
+    # Skips cleanly until the bump App exists, rather than failing the run on
+    # an empty client-id. Until then a merge still builds and pushes the image;
+    # it just does not propose the deploy.
+    if: needs.image.result == 'success' && vars.BUMP_APP_CLIENT_ID != ''
+    runs-on: hailo-detect-runner
+
+    env:
+      INFRA_REPO: jordanthomas761/homelab-infra
+      MANIFEST: apps/hailo-detect/manifests/deployment.yaml
+
+    steps:
+      # A GitHub App, not a PAT, and not GITHUB_TOKEN.
+      #
+      # GITHUB_TOKEN cannot reach another repository at all. A PAT could, but
+      # it dies with the account it belongs to -- the same reasoning
+      # homelab-infra's renovate.yml sets out. The App's installation token is
+      # minted per run, expires in an hour, and is scoped by `repositories:`
+      # below to the one repo this needs to write to.
+      #
+      # It also has to not be GITHUB_TOKEN for a second reason: GitHub
+      # suppresses workflow runs on PRs opened with it, so validate would never
+      # run on the bump -- and validate passing is the whole gate the automerge
+      # over there waits on.
+      - name: Mint an installation token
+        id: app-token
+        uses: actions/create-github-app-token@v3.2.0
+        with:
+          client-id: ${{ vars.BUMP_APP_CLIENT_ID }}
+          private-key: ${{ secrets.BUMP_APP_PRIVATE_KEY }}
+          owner: jordanthomas761
+          repositories: homelab-infra
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.INFRA_REPO }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: infra
+
+      - name: Rewrite the image tag
+        id: bump
+        working-directory: infra
+        env:
+          IMAGE_TAG: ${{ needs.image.outputs.tag }}
+        run: |
+          prefix="${REGISTRY}/${IMAGE_NAME}:"
+
+          if [ ! -f "$MANIFEST" ]; then
+            echo "::notice::$MANIFEST does not exist yet -- nothing to bump."
+            echo "::notice::Set the image to ${prefix}${IMAGE_TAG} when you create it."
+            exit 0
+          fi
+
+          # Anchored on the full image prefix, and required to match exactly
+          # once. A zero or double match means the manifest was restructured,
+          # and rewriting the wrong line is worse than failing here.
+          matches="$(grep -c "image: ${prefix}" "$MANIFEST" || true)"
+          if [ "$matches" != "1" ]; then
+            echo "::error::expected exactly one 'image: ${prefix}...' line in $MANIFEST, found $matches"
+            exit 1
+          fi
+
+          sed -i "s|image: ${prefix}.*|image: ${prefix}${IMAGE_TAG}|" "$MANIFEST"
+
+          if git diff --quiet; then
+            echo "::notice::$MANIFEST already points at ${IMAGE_TAG}"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open the bump PR
+        if: steps.bump.outputs.changed
+        working-directory: infra
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          IMAGE_TAG: ${{ needs.image.outputs.tag }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          # Plain bot identity is enough here. renovate.yml next door goes to
+          # the trouble of resolving the bot's numeric user id because Renovate
+          # re-reads its own branches and treats an author mismatch as "a human
+          # edited this"; a one-shot bump never looks at the branch again.
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+
+          # The branch name carries the tag, so re-running this workflow for
+          # the same commit lands on the same branch rather than opening a
+          # second PR for an identical change.
+          branch="bump/hailo-detect-${IMAGE_TAG}"
+          url="$(gh pr list --head "$branch" --state open --json url --jq '.[0].url // empty')"
+
+          if [ -n "$url" ]; then
+            echo "::notice::already open: $url"
+          else
+            git switch -c "$branch"
+            git commit -qam "Deploy hailo-detect ${IMAGE_TAG}"
+            # --force is deliberate and safe: this branch is machine-owned,
+            # named after the tag, and its content is fully determined by that
+            # tag, so the only thing it can overwrite is an identical edit from
+            # an earlier run of this same job.
+            git push -q --force origin "$branch"
+
+            body="$(printf '%s\n' \
+              "Image built from \`${GITHUB_REPOSITORY}@${GITHUB_SHA}\`:" \
+              "" \
+              "\`${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}\`" \
+              "" \
+              "Opened by that repo's ci workflow. Merged by automerge.yml here once validate passes.")"
+
+            url="$(gh pr create --base main --head "$branch" \
+              --title "Deploy hailo-detect ${IMAGE_TAG}" --body "$body")"
+          fi
+
+          echo "::notice::$url"
+          {
+            echo "### Deploying"
+            echo
+            echo "\`${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}\` -> $url"
+          } >> "$GITHUB_STEP_SUMMARY"

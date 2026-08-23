@@ -1,0 +1,54 @@
+[project]
+name = "hailo-detect"
+version = "0.1.0"
+description = "Object detection service for the Hailo-8 accelerator on the homelab cluster"
+requires-python = ">=3.13"
+
+# HailoRT's Python bindings are deliberately absent: they are installed from
+# the Raspberry Pi apt repo as python3-hailort, pinned to the host driver
+# version (see the Dockerfile). There is no PyPI distribution of them, and the
+# venv is created with --system-site-packages so this list sits alongside it.
+dependencies = [
+  "fastapi==0.121.2",
+  "uvicorn[standard]==0.38.0",
+  "python-multipart==0.0.20",
+  "pillow==12.1.0",
+  # Deliberately a range where everything else is pinned. python3-hailort is
+  # built against Debian's python3-numpy, and the venv is created with
+  # --system-site-packages, so a range lets pip reuse that exact build inside
+  # the image (see the Dockerfile) rather than shadowing it with its own.
+  "numpy>=2.1,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==9.0.1",
+  # fastapi.testclient is a re-export of starlette's, which imports httpx at
+  # module scope and raises if it is missing. FastAPI does not depend on it,
+  # so it has to be declared here or the app tests fail at collection.
+  "httpx==0.28.1",
+  "ruff==0.15.1",
+]
+
+[project.scripts]
+hailo-detect = "hailo_detect.__main__:main"
+
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+hailo_detect = ["static/*"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
