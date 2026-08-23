@@ -42,6 +42,19 @@ mounting the device node is enough. The cluster's `policy/workloads.rego`
 rejects a privileged container whose name isn't in its allowlist, so asking for
 it fails CI over there rather than failing at runtime here.
 
+**The Raspberry Pi archive key is SHA-1, and trixie's apt rejects it.**
+Debian 13 verifies repository signatures with Sequoia's `sqv` rather than
+`gpgv`, and `sqv`'s default policy stopped accepting SHA-1 on 2026-02-01. The
+archive key's own binding signature predates that and has not been re-signed,
+so `apt-get update` reports the repo as *"not signed"* and the image build
+fails outright. Nothing about the archive changed — the verifier did. The
+Dockerfile derives `/etc/crypto-policies/back-ends/apt-sequoia.config` from
+apt's default and re-allows SHA-1 only where second pre-image resistance is
+sufficient (binding a key to its certificate), leaving it rejected where
+collision resistance is what matters (the signature over `Release`). The date
+is finite on purpose: the real fix is upstream re-signing, and a permanent
+exemption would outlive it silently.
+
 **`hailort.service` is active on the host.** Whether it holds the device in a
 way that blocks a container opening `/dev/hailo0` directly is untested — first
 thing to check if device-open fails.
@@ -214,11 +227,11 @@ needs:
 The application, the image and CI are here and the test suite passes. What has
 **not** happened yet:
 
-- **Nothing has run on the hardware.** The image has never been built against
-  the Raspberry Pi archive, and no inference has run on the Hailo-8. The
-  package pins were checked against the archive index — `hailort=4.23.0`,
-  `python3-hailort=4.23.0-1`, and `yolov8s_h8.hef`/`yolov6n_h8.hef` in
-  `hailo-models` — but that is not the same as a build.
+- **No inference has run on the Hailo-8.** The first CI build reached the
+  Raspberry Pi archive and failed on its SHA-1 signing key (see above); the
+  package pins themselves were checked against the archive index —
+  `hailort=4.23.0`, `python3-hailort=4.23.0-1`, and
+  `yolov8s_h8.hef`/`yolov6n_h8.hef` in `hailo-models`.
 - **The NMS output format is decoded, not confirmed.** `postprocess.py`
   handles both containers HailoRT is known to use and raises with the shape it
   actually saw for anything else, rather than quietly returning no detections.
