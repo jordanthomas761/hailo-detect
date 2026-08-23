@@ -31,8 +31,45 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && curl -fsSL https://archive.raspberrypi.com/debian/raspberrypi.gpg.key \
        | gpg --dearmor -o /usr/share/keyrings/raspberrypi-archive-keyring.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/raspberrypi-archive-keyring.gpg]" \
-            "http://archive.raspberrypi.com/debian trixie main" \
+            "https://archive.raspberrypi.com/debian trixie main" \
        > /etc/apt/sources.list.d/raspi.list
+
+# Let apt accept the Raspberry Pi archive key, whose own binding signature is
+# SHA-1.
+#
+# trixie's apt verifies with Sequoia's sqv instead of gpgv, and sqv's default
+# policy stopped accepting SHA-1 on 2026-02-01. The archive key predates that
+# and has not been re-signed, so from that date apt reports the repository as
+# "not signed" and every build here fails at apt-get update. Nothing about the
+# archive changed; the verifier did.
+#
+# What this relaxes is narrow, and the error message draws the distinction
+# itself: SHA-1 is re-allowed only where *second pre-image* resistance is
+# enough, which is what binding a signing key to its certificate needs. Where
+# collision resistance is what matters -- the signature over the Release file,
+# the thing that actually attests to the package hashes -- SHA-1 stays
+# rejected. The sources.list line above is https for the same reason: with one
+# aspect of the signature policy relaxed, transport integrity is worth having
+# rather than trusting plain http.
+#
+# The date is deliberately finite. When it passes this breaks again and has to
+# be looked at, which is the intended behaviour -- the real fix is upstream
+# re-signing their key (`sq cert lint --fix`), and a permanent exemption here
+# would quietly outlive that.
+RUN set -eu; \
+    if [ ! -f /usr/share/apt/default-sequoia.config ]; then \
+      echo "no default sequoia policy to derive from -- has apt's verifier changed again?" >&2; \
+      exit 1; \
+    fi; \
+    mkdir -p /etc/crypto-policies/back-ends; \
+    sed 's|^sha1.second_preimage_resistance = .*|sha1.second_preimage_resistance = 2027-02-01|' \
+      /usr/share/apt/default-sequoia.config \
+      > /etc/crypto-policies/back-ends/apt-sequoia.config; \
+    if ! grep -q '^sha1.second_preimage_resistance = 2027-02-01$' \
+         /etc/crypto-policies/back-ends/apt-sequoia.config; then \
+      echo "sha1 stanza not found in the default policy -- the key name has changed" >&2; \
+      exit 1; \
+    fi
 
 
 # ---------------------------------------------------------------------------
