@@ -132,6 +132,7 @@ def test_detect_feeds_the_engine_a_frame_at_the_model_input_size(client):
     frame = client.engine.frames[0]
     assert frame.shape == (INPUT_SIZE[1], INPUT_SIZE[0], 3)
     assert frame.dtype.name == "uint8"
+    assert frame.flags["WRITEABLE"]
 
 
 def test_annotated_returns_a_jpeg_of_the_original_size(client):

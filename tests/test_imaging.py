@@ -78,6 +78,9 @@ def test_to_input_array_is_contiguous_hwc_uint8():
     assert array.shape == (640, 640, 3)
     assert array.dtype.name == "uint8"
     assert array.flags["C_CONTIGUOUS"]
+    # HailoRT writes results into the buffer it is given and rejects a
+    # read-only one -- which is what PIL's own buffer is.
+    assert array.flags["WRITEABLE"]
 
 
 def test_draw_detections_does_not_resize_or_mutate():
