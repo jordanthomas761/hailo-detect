@@ -100,35 +100,46 @@ call equivalent are not:
 The Dockerfile sets the working form. The failure mode of the second is the
 nasty one: it looks exactly like the service not being configured at all.
 
-**A USB HDMI capture dongle is attached, and it takes `/dev/video0`.** No CSI
-Camera Module. `v4l2-ctl --list-devices` reports it as *"Nintendo Switch
-(usb-xhci-hcd.1-1)"* — a product string, not a console — on `/dev/video0`,
-`/dev/video1` (the metadata node UVC devices expose alongside capture) and
-`/dev/media3`. So the older note that the low-numbered `/dev/video*` nodes are
-the Pi's codec units does not hold while this is plugged in.
+**A USB webcam is attached, and it takes `/dev/video0`.** No CSI Camera
+Module. It is a Nintendo-branded UVC camera — `usb-Nintendo_Co.__Ltd._Camera_Device`
+— on `/dev/video0`, `/dev/video1` (the metadata node UVC devices expose
+alongside capture) and `/dev/media3`. So the older note that the low-numbered
+`/dev/video*` nodes are the Pi's codec units does not hold while this is
+plugged in.
 
-**It is a capture card, not a camera: no HDMI source, no frames.** It produces
-video only while something is plugged into its HDMI input and actively
-outputting. An empty stream is the expected state otherwise, not a fault — check
-the HDMI side before debugging anything here.
-
-**Node numbers are recycled, so do not hardcode them.** This dongle and a
+**Node numbers are recycled, so do not hardcode them.** This camera and a
 Logitech MX Brio, tried separately, both enumerated as exactly `/dev/video0`,
-`/dev/video1`, `/dev/media3`. Reference a
-`/dev/v4l/by-id/usb-...-video-index0` path instead, which is stable across
-replug and unambiguous about which device you meant.
+`/dev/video1`, `/dev/media3`. Use the stable path:
+
+    /dev/v4l/by-id/usb-Nintendo_Co.__Ltd._Camera_Device_000000000001-video-index0
+
+**MJPEG, not YUYV, and this is measured rather than assumed.** From
+`v4l2-ctl --list-formats-ext`:
+
+| resolution | YUYV | MJPG |
+|---|---|---|
+| 1920x1080 | not offered | 30 fps |
+| 1280x720 | 10 fps | 30 fps |
+| 640x480 | 30 fps | 60 fps |
+
+YUYV at 720p caps at 10 fps because uncompressed frames saturate USB 2.0.
+Whatever publishes this must ask for MJPEG explicitly — ffmpeg negotiates YUYV
+by default, which is how you end up with a 10 fps stream and no obvious reason
+for it.
 
 **A container cannot read it, for the same reason it cannot read
 `/dev/hailo0`.** It is a device node, so `hostPath` gives `EPERM` from the
 device cgroup. The pattern that worked for the accelerator applies unchanged:
 the host owns the hardware and publishes it, the container consumes a URL.
 `ustreamer` (MJPEG over HTTP) is the simpler publisher for a UVC device;
-MediaMTX with an ffmpeg `v4l2` input gives you RTSP. Pass `-input_format mjpeg`
-either way — otherwise ffmpeg negotiates raw YUYV, and on a USB 2.0 capture
-chip that caps you at a few frames a second. Pick a resolution explicitly too:
-the dongle will happily hand over 1080p from an HDMI source, and the model
-wants 640x640, so downscaling on the host saves shipping pixels over USB and
-the network to throw them away.
+MediaMTX with an ffmpeg `v4l2` input gives you RTSP instead.
+
+Ask for a resolution explicitly. The model input is 640x640, and the service
+letterboxes to fit, so aspect ratio decides how much of that square carries
+picture: 1280x720 fills 640x360 of it (56%), while 640x480 fills 640x480
+(75%). 720p is the better trade anyway — the extra detail survives the
+downscale, and 1080p only spends USB bandwidth on pixels that are about to be
+thrown away.
 
 ## Models
 
