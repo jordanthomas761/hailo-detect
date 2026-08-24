@@ -46,8 +46,16 @@ def letterbox(image: Image.Image, size: tuple[int, int]) -> tuple[Image.Image, L
 
 
 def to_input_array(image: Image.Image) -> np.ndarray:
-    """A contiguous HWC uint8 RGB array, which is what the input vstream wants."""
-    return np.ascontiguousarray(np.asarray(image.convert("RGB"), dtype=np.uint8))
+    """A writeable, contiguous HWC uint8 RGB array for the input vstream.
+
+    np.array rather than np.asarray, and the difference is not stylistic:
+    PIL exposes a read-only buffer, np.asarray wraps it without copying, and
+    np.ascontiguousarray hands back the same read-only object when it is
+    already contiguous. HailoRT rejects that with "array is not writeable"
+    from inside pipeline.infer -- it takes the buffer to write results into.
+    np.array copies, so the result is writeable and C-contiguous.
+    """
+    return np.array(image.convert("RGB"), dtype=np.uint8)
 
 
 def map_to_source(detection: Detection, box: Letterbox) -> Detection:

@@ -288,7 +288,10 @@ class RtspWorker:
 
     def _detect_frame(self, buffer: bytes) -> None:
         width, height = self._engine.input_size
-        frame = np.frombuffer(buffer, dtype=np.uint8).reshape(height, width, 3)
+        # .copy() for two reasons: np.frombuffer over bytes is read-only and
+        # HailoRT needs a writeable buffer, and the slot's bytes may be
+        # replaced by the reader thread while this frame is in flight.
+        frame = np.frombuffer(buffer, dtype=np.uint8).reshape(height, width, 3).copy()
         result = self._engine.infer(frame)
 
         # The frame is already letterboxed to the network input, so its own
