@@ -60,14 +60,19 @@ class Settings:
     infer_queue_size: int = 8
     infer_timeout_s: float = 15.0
 
-    rtsp_url: str | None = None
+    # Any URL ffmpeg can read: rtsp://, http:// (an MJPEG stream), or a file.
+    # It is not RTSP-specific -- a USB capture device on the host is easier to
+    # publish as MJPEG over HTTP than as RTSP.
+    stream_url: str | None = None
+    # Applies to rtsp:// only, and is passed only for those URLs; ffmpeg
+    # errors on an unknown option rather than ignoring it.
     rtsp_transport: str = "tcp"
-    rtsp_fps: float = 5.0
+    stream_fps: float = 5.0
     # ffmpeg is restarted with this backoff when the source drops. Cameras
     # reboot, and a stream that never comes back on its own is worse than one
     # that reconnects noisily.
-    rtsp_reconnect_min_s: float = 1.0
-    rtsp_reconnect_max_s: float = 30.0
+    stream_reconnect_min_s: float = 1.0
+    stream_reconnect_max_s: float = 30.0
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -84,7 +89,9 @@ class Settings:
             jpeg_quality=_int("JPEG_QUALITY", cls.jpeg_quality),
             infer_queue_size=_int("INFER_QUEUE_SIZE", cls.infer_queue_size),
             infer_timeout_s=_float("INFER_TIMEOUT_S", cls.infer_timeout_s),
-            rtsp_url=_opt_str("RTSP_URL"),
+            # RTSP_URL/RTSP_FPS still work: they were the original names and
+            # cost nothing to keep.
+            stream_url=_opt_str("STREAM_URL") or _opt_str("RTSP_URL"),
             rtsp_transport=transport,
-            rtsp_fps=_float("RTSP_FPS", cls.rtsp_fps),
+            stream_fps=_float("STREAM_FPS", _float("RTSP_FPS", cls.stream_fps)),
         )
