@@ -51,6 +51,51 @@ def redact(url: str) -> str:
     return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
+def ffmpeg_command(
+    url: str,
+    *,
+    transport: str,
+    fps: float,
+    width: int,
+    height: int,
+) -> list[str]:
+    """The argv to pull `url` as letterboxed rgb24 frames on stdout.
+
+    Split out from the worker because the input-specific flags are the part
+    most likely to be wrong, and this way they can be asserted without an
+    ffmpeg or a camera.
+    """
+    # Pad colour 0x727272 == (114, 114, 114), matching imaging._PAD so an
+    # uploaded image and a stream frame are letterboxed identically.
+    video_filter = (
+        f"fps={fps},"
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x727272"
+    )
+
+    command = ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error"]
+
+    # Only for RTSP. These are demuxer options on the rtsp demuxer, and ffmpeg
+    # exits on an option the input does not recognise rather than ignoring it
+    # -- so passing them for an http MJPEG source breaks it outright.
+    #
+    # -timeout is socket I/O timeout in microseconds: fail the connect rather
+    # than hang forever on a camera that is off, and let the reconnect loop
+    # retry. It is spelled -timeout on the RTSP demuxer in ffmpeg >= 5.0; the
+    # older -stimeout name is gone in the ffmpeg 7.x Debian trixie ships.
+    if urlsplit(url).scheme in {"rtsp", "rtsps"}:
+        command += ["-rtsp_transport", transport, "-timeout", "5000000"]
+
+    return command + [
+        "-i", url,
+        "-an", "-sn",
+        "-vf", video_filter,
+        "-f", "rawvideo",
+        "-pix_fmt", "rgb24",
+        "-",
+    ]
+
+
 class _Slot:
     """A one-slot buffer with a sequence number, for latest-frame-wins."""
 
@@ -82,13 +127,13 @@ class _Slot:
             return self._value, self._seq
 
 
-class RtspWorker:
+class StreamWorker:
     def __init__(self, settings: Settings, engine: HailoEngine) -> None:
-        if not settings.rtsp_url:
-            raise ValueError("RtspWorker needs settings.rtsp_url")
+        if not settings.stream_url:
+            raise ValueError("RtspWorker needs settings.stream_url")
         self._settings = settings
         self._engine = engine
-        self._url = settings.rtsp_url
+        self._url = settings.stream_url
         self._stopping = threading.Event()
 
         self._raw = _Slot()
@@ -140,7 +185,7 @@ class RtspWorker:
                 "frames_read": self._frames_read,
                 "frames_detected": self._frames_detected,
                 "frames_dropped": self._frames_dropped,
-                "target_fps": self._settings.rtsp_fps,
+                "target_fps": self._settings.stream_fps,
                 "detections": [d.as_dict() for d in self._detections],
             }
 
@@ -162,37 +207,16 @@ class RtspWorker:
     # -- reader ------------------------------------------------------------
 
     def _ffmpeg_command(self, width: int, height: int) -> list[str]:
-        settings = self._settings
-        # Pad colour 0x727272 == (114, 114, 114), matching imaging._PAD so an
-        # uploaded image and a stream frame are letterboxed identically.
-        video_filter = (
-            f"fps={settings.rtsp_fps},"
-            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x727272"
+        return ffmpeg_command(
+            self._url,
+            transport=self._settings.rtsp_transport,
+            fps=self._settings.stream_fps,
+            width=width,
+            height=height,
         )
-        return [
-            "ffmpeg",
-            "-hide_banner",
-            "-nostdin",
-            "-loglevel", "error",
-            "-rtsp_transport", settings.rtsp_transport,
-            # Socket I/O timeout, in microseconds -- fail the connect
-            # rather than hang forever on a camera that is off, and let the
-            # reconnect loop below retry. This option is spelled `-timeout`
-            # on the RTSP demuxer in ffmpeg >= 5.0; the older `-stimeout`
-            # name is gone in the ffmpeg 7.x that Debian trixie ships, and an
-            # unknown demuxer option makes ffmpeg exit rather than warn.
-            "-timeout", "5000000",
-            "-i", self._url,
-            "-an", "-sn",
-            "-vf", video_filter,
-            "-f", "rawvideo",
-            "-pix_fmt", "rgb24",
-            "-",
-        ]
 
     def _read_loop(self) -> None:
-        backoff = self._settings.rtsp_reconnect_min_s
+        backoff = self._settings.stream_reconnect_min_s
         while not self._stopping.is_set():
             try:
                 width, height = self._engine.input_size
@@ -208,14 +232,14 @@ class RtspWorker:
                 # A session that lasted a while was healthy: reset the backoff
                 # so a nightly camera reboot does not creep towards 30s waits.
                 if time.monotonic() - connected_at > 30:
-                    backoff = self._settings.rtsp_reconnect_min_s
+                    backoff = self._settings.stream_reconnect_min_s
             except Exception as exc:  # noqa: BLE001 -- reconnecting is the whole job
                 self._note_error(f"{type(exc).__name__}: {exc}")
 
             if self._stopping.is_set():
                 return
             time.sleep(backoff)
-            backoff = min(backoff * 2, self._settings.rtsp_reconnect_max_s)
+            backoff = min(backoff * 2, self._settings.stream_reconnect_max_s)
 
     def _stream_once(self, width: int, height: int) -> None:
         frame_bytes = width * height * 3

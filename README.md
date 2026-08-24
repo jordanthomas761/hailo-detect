@@ -100,9 +100,28 @@ call equivalent are not:
 The Dockerfile sets the working form. The failure mode of the second is the
 nasty one: it looks exactly like the service not being configured at all.
 
-**No camera is attached.** `rpicam-hello --list-cameras` reports none; the
-`/dev/video*` nodes are the Pi's codec units, not a sensor. So input is uploaded
-media or a pulled RTSP stream until a Camera Module goes in.
+**A USB camera is attached, and it takes `/dev/video0`.** No CSI Camera
+Module — `v4l2-ctl --list-devices` reports a UVC device on `/dev/video0`,
+`/dev/video1` (the metadata node UVC devices expose alongside capture) and
+`/dev/media3`. So the older note that the low-numbered `/dev/video*` nodes are
+the Pi's codec units does not hold while a USB camera is plugged in.
+
+**Node numbers are recycled, so do not hardcode them.** Two different devices
+— a Logitech MX Brio and an HDMI capture dongle — both enumerated as exactly
+`/dev/video0`, `/dev/video1`, `/dev/media3`. Reference a
+`/dev/v4l/by-id/usb-...-video-index0` path instead, which is stable across
+replug and unambiguous about which device you meant.
+
+**A container cannot read it, for the same reason it cannot read
+`/dev/hailo0`.** It is a device node, so `hostPath` gives `EPERM` from the
+device cgroup. The pattern that worked for the accelerator applies unchanged:
+the host owns the hardware and publishes it, the container consumes a URL.
+`ustreamer` (MJPEG over HTTP) is the simpler publisher for a UVC device;
+MediaMTX with an ffmpeg `v4l2` input gives you RTSP. Pass
+`-input_format mjpeg` either way — otherwise ffmpeg negotiates raw YUYV and
+USB bandwidth caps you at a few frames a second — and pick a resolution
+explicitly, since a 4K camera will otherwise hand you far more pixels than a
+640x640 model wants.
 
 ## Models
 
@@ -117,9 +136,9 @@ A FastAPI service with a small web UI at `/`:
 
 - **Upload an image** — `POST /api/detect` returns JSON boxes,
   `POST /api/detect/annotated` returns the same image with the boxes drawn on.
-- **Watch an RTSP source** — set `RTSP_URL` and the service pulls the stream
-  with ffmpeg, detects continuously, and serves an annotated MJPEG preview at
-  `/api/stream/mjpeg`.
+- **Watch a stream** — set `STREAM_URL` to anything ffmpeg can read (`rtsp://`,
+  an `http://` MJPEG stream, a file) and the service pulls it, detects
+  continuously, and serves an annotated MJPEG preview at `/api/stream/mjpeg`.
 - `/healthz`, `/readyz` and `/api/status` for the cluster and for you.
 
 ```
@@ -169,13 +188,18 @@ All environment, all optional.
 | `JPEG_QUALITY` | `80` | |
 | `INFER_QUEUE_SIZE` | `8` | |
 | `INFER_TIMEOUT_S` | `15` | |
-| `RTSP_URL` | *unset* | Unset means the stream half stays dormant |
-| `RTSP_TRANSPORT` | `tcp` | `tcp` or `udp` |
-| `RTSP_FPS` | `5` | What ffmpeg is asked for, not what the device sustains |
+| `STREAM_URL` | *unset* | Any URL ffmpeg can read. Unset means the stream half stays dormant |
+| `RTSP_TRANSPORT` | `tcp` | `tcp` or `udp`, and passed only for `rtsp://` URLs |
+| `STREAM_FPS` | `5` | What ffmpeg is asked for, not what the source sustains |
 | `LOG_LEVEL` | `INFO` | |
 
-`RTSP_URL` usually carries credentials. Deliver it as a SealedSecret and load
-it with `envFrom`, not as a literal in the Deployment — and note the service
+`STREAM_URL` is not RTSP-specific. The RTSP-only ffmpeg flags are passed only
+for `rtsp://` URLs, because ffmpeg exits on an input option the demuxer does
+not recognise rather than ignoring it — which is what made this RTSP-only
+before. `RTSP_URL` and `RTSP_FPS` are still accepted as the older names.
+
+If the URL carries credentials, deliver it as a SealedSecret and load it with
+`envFrom` rather than as a literal in the Deployment — and note the service
 redacts the userinfo before the URL reaches a log line or `/api/status`.
 
 ## Working on it without a Hailo
@@ -282,8 +306,9 @@ Still open:
 - **No detection has been run on a real image.** The inference above was on
   random noise, which correctly produced nothing. Boxes on a real photo, and
   whether the labels line up with COCO's class order, are unverified.
-- **The RTSP path has never run.** No camera is attached, so it needs a URL to
-  point at.
+- **The stream path has never run.** Nothing has fed it a URL, so the reader
+  loop, the reconnect backoff and the MJPEG endpoint are all unexercised. A
+  camera is attached now, but nothing publishes it yet.
 - **Nothing is measured under load.** The queue depth, the timeout and the
   memory request are all estimates; 25.4 ms for one frame is not a throughput
   figure.

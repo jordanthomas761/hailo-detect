@@ -24,7 +24,7 @@ from .imaging import (
     to_input_array,
 )
 from .postprocess import Detection
-from .stream import RtspWorker
+from .stream import StreamWorker
 
 log = logging.getLogger(__name__)
 
@@ -47,9 +47,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # behind a restart count.
             log.error("hailo device unavailable: %s", engine.error)
 
-        worker: RtspWorker | None = None
-        if settings.rtsp_url:
-            worker = RtspWorker(settings, engine)
+        worker: StreamWorker | None = None
+        if settings.stream_url:
+            worker = StreamWorker(settings, engine)
             worker.start()
 
         app.state.settings = settings
@@ -81,10 +81,10 @@ def _engine(request: Request) -> HailoEngine:
     return request.app.state.engine
 
 
-def _stream(request: Request) -> RtspWorker:
+def _stream(request: Request) -> StreamWorker:
     worker = request.app.state.stream
     if worker is None:
-        raise HTTPException(status_code=404, detail="no RTSP source configured (set RTSP_URL)")
+        raise HTTPException(status_code=404, detail="no stream source configured (set STREAM_URL)")
     return worker
 
 
