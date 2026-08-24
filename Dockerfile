@@ -158,9 +158,18 @@ WORKDIR /home/app
 # HAILORT_LOGGER_PATH: HailoRT writes hailort.log into the process's working
 # directory when it cannot reach its own log dir. Pointing it at /tmp keeps
 # the image runnable with a read-only root filesystem and an emptyDir /tmp.
+# HAILORT_SERVICE_ADDRESS: the app reaches the accelerator through
+# hailort_service rather than opening /dev/hailo0, which a container cannot do
+# under Kubernetes. Setting it is what selects the service at all -- without
+# it libhailort ignores multi_process_service and goes to the device -- and
+# the spelling is load-bearing. libhailort hands this straight to gRPC as a
+# channel target: `unix:/path` connects, `unix:///path` silently falls back to
+# the device, and a bare `/path` reaches gRPC but fails UNAVAILABLE. The pod
+# spec mounts the host's socket at this path.
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    HAILORT_SERVICE_ADDRESS=unix:/tmp/hailort_uds.sock \
     HAILORT_LOGGER_PATH=/tmp \
     HEF_PATH=/usr/share/hailo-models/yolov8s_h8.hef \
     PORT=8000

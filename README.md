@@ -85,6 +85,21 @@ Using the service also forces the scheduler on (`ROUND_ROBIN`), which makes
 `network_group.activate()` illegal. Reverting to direct device access means
 restoring that call *and* solving the cgroup problem above.
 
+**`HAILORT_SERVICE_ADDRESS` must be set, and its exact spelling decides
+whether any of this works.** `multi_process_service = True` on its own is
+ignored — libhailort goes to `/dev/hailo0` anyway. The address is handed
+straight to gRPC as a channel target, and the three spellings a human would
+call equivalent are not:
+
+| value | result |
+|---|---|
+| `unix:/tmp/hailort_uds.sock` | connects |
+| `unix:///tmp/hailort_uds.sock` | silently falls back to opening `/dev/hailo0` |
+| `/tmp/hailort_uds.sock` | reaches gRPC, fails `UNAVAILABLE` (code 14) |
+
+The Dockerfile sets the working form. The failure mode of the second is the
+nasty one: it looks exactly like the service not being configured at all.
+
 **No camera is attached.** `rpicam-hello --list-cameras` reports none; the
 `/dev/video*` nodes are the Pi's codec units, not a sensor. So input is uploaded
 media or a pulled RTSP stream until a Camera Module goes in.
@@ -250,20 +265,25 @@ needs:
 
 ## Status
 
-The application, the image and CI are here and the test suite passes. What has
-**not** happened yet:
+**It runs on the hardware.** Measured in-cluster, from an unprivileged pod with
+no device node mounted, talking to `hailort_service`:
 
-- **No inference has run on the Hailo-8.** The first CI build reached the
-  Raspberry Pi archive and failed on its SHA-1 signing key (see above); the
-  package pins themselves were checked against the archive index —
-  `hailort=4.23.0`, `python3-hailort=4.23.0-1`, and
-  `yolov8s_h8.hef`/`yolov6n_h8.hef` in `hailo-models`.
-- **The NMS output format is decoded, not confirmed.** `postprocess.py`
-  handles both containers HailoRT is known to use and raises with the shape it
-  actually saw for anything else, rather than quietly returning no detections.
-  The first real inference is what settles it.
-- **`hailort.service` on the host is still untested** against a container
-  opening `/dev/hailo0`. If device-open fails, `/readyz` will say so — check
-  this first.
-- The homelab-infra half does not exist: no `apps/hailo-detect/`, no
-  `apps/arc-runners-hailo-detect/`, and no registry secrets on the repo.
+    model      : yolov8s input 640 x 640
+    inference  : 25.4 ms
+    raw type   : list
+    decode_nms : OK
+
+That settles two things that were assumptions for most of this repo's life:
+the accelerator is reachable this way at all, and the NMS output arrives in
+the ragged per-class `list` form `postprocess.py` handles.
+
+Still open:
+
+- **No detection has been run on a real image.** The inference above was on
+  random noise, which correctly produced nothing. Boxes on a real photo, and
+  whether the labels line up with COCO's class order, are unverified.
+- **The RTSP path has never run.** No camera is attached, so it needs a URL to
+  point at.
+- **Nothing is measured under load.** The queue depth, the timeout and the
+  memory request are all estimates; 25.4 ms for one frame is not a throughput
+  figure.
