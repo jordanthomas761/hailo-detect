@@ -189,9 +189,30 @@ class HailoEngine:
         settings = self._settings
 
         params = hpf.VDevice.create_params()
-        # One model in one process: the multi-model scheduler buys nothing,
-        # and with it enabled `network_group.activate()` is rejected outright.
-        params.scheduling_algorithm = hpf.HailoSchedulingAlgorithm.NONE
+        # Go through hailort_service rather than opening /dev/hailo0.
+        #
+        # A container cannot open the device node directly under Kubernetes:
+        # a hostPath mount hands over the inode but adds no device-cgroup
+        # rule, so open() returns EPERM even though the node is mode 666.
+        # (`docker --device` adds that rule for you, which is why the same
+        # image works under plain Docker and the README used to claim this
+        # was enough.) The alternatives were a privileged device plugin or
+        # this.
+        #
+        # hailort_service already runs on the host as a systemd unit and owns
+        # the device, so the client side needs no device access at all --
+        # only its Unix socket, mounted in at the path HailoRT expects. It
+        # also means several pods can share one accelerator, which direct
+        # access cannot do.
+        params.multi_process_service = True
+        # The service requires the scheduler. That is not a free choice: with
+        # ROUND_ROBIN enabled, `network_group.activate()` becomes illegal and
+        # the scheduler activates network groups itself -- which is why the
+        # activate() call that used to wrap the inference loop is gone.
+        params.scheduling_algorithm = hpf.HailoSchedulingAlgorithm.ROUND_ROBIN
+        # Clients naming the same group share one underlying VDevice instead
+        # of each trying to claim the device for themselves.
+        params.group_id = "SHARED"
 
         with hpf.VDevice(params) as vdevice:
             hef = hpf.HEF(settings.hef_path)
@@ -199,7 +220,6 @@ class HailoEngine:
                 hef, interface=hpf.HailoStreamInterface.PCIe
             )
             network_group = vdevice.configure(hef, configure_params)[0]
-            network_group_params = network_group.create_params()
 
             input_info = hef.get_input_vstream_infos()[0]
             output_info = hef.get_output_vstream_infos()[0]
@@ -220,7 +240,7 @@ class HailoEngine:
                 self._model_name = network_group.name
 
             log.info(
-                "hailo device open: model=%s input=%dx%d output=%s hef=%s",
+                "hailo device open via hailort_service: model=%s input=%dx%d output=%s hef=%s",
                 network_group.name,
                 width,
                 height,
@@ -228,10 +248,8 @@ class HailoEngine:
                 settings.hef_path,
             )
 
-            with (
-                hpf.InferVStreams(network_group, input_params, output_params) as pipeline,
-                network_group.activate(network_group_params),
-            ):
+            # No activate() here -- see the scheduler note above.
+            with hpf.InferVStreams(network_group, input_params, output_params) as pipeline:
                 with self._lock:
                     # The device is open, so any error start() recorded while
                     # it was still opening is stale.
