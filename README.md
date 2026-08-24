@@ -37,10 +37,22 @@ The node carries a `workload-type: ml` label; that is the `nodeSelector`.
 A mismatch fails at device-open with a version error, not at build time. Pin
 both, and bump them in the same commit as the host.
 
-**No `privileged` needed, and don't ask for it.** `/dev/hailo0` is mode 666, so
-mounting the device node is enough. The cluster's `policy/workloads.rego`
-rejects a privileged container whose name isn't in its allowlist, so asking for
-it fails CI over there rather than failing at runtime here.
+**Mounting `/dev/hailo0` into a pod does not work, and `privileged` is not
+the answer.** The device node is mode 666, so this *looks* like it should be
+enough — and under `docker --device` it is. Under Kubernetes it is not: a
+`hostPath` mount hands the container the device inode but adds no
+device-cgroup rule, and `open()` returns **`EPERM`** (not `EACCES` — the mode
+bits were never the problem). Measured from inside the pod:
+
+    node    : 0o666  chardev=True  major/minor=237/0
+    uid/gid : 10001 10001
+    open    : FAILED errno=1 Operation not permitted
+
+The two ways out are a device plugin, which is itself a privileged DaemonSet,
+or going through `hailort_service` — which is what this service does. Keep it
+that way: `policy/workloads.rego` rejects a privileged container whose name is
+not in its allowlist, so asking for it fails CI over there rather than at
+runtime here.
 
 **The Raspberry Pi archive key is SHA-1, and trixie's apt rejects it.**
 Debian 13 verifies repository signatures with Sequoia's `sqv` rather than
@@ -55,9 +67,23 @@ collision resistance is what matters (the signature over `Release`). The date
 is finite on purpose: the real fix is upstream re-signing, and a permanent
 exemption would outlive it silently.
 
-**`hailort.service` is active on the host.** Whether it holds the device in a
-way that blocks a container opening `/dev/hailo0` directly is untested — first
-thing to check if device-open fails.
+**`hailort.service` on the host is load-bearing, not an obstacle.** It was
+suspected of holding the device and blocking a container; it does not —
+`sudo fuser -v /dev/hailo0` shows nothing holding it, because the service only
+opens the device once a client connects. It is HailoRT's multi-process
+service, and this app is one of its clients: `multi_process_service = True`,
+`group_id = "SHARED"`, talking to `/tmp/hailort_uds.sock` mounted in from the
+host.
+
+Two consequences. Several pods can share the one accelerator, which direct
+device access cannot do. And the app now depends on a **systemd unit that
+GitOps does not manage** — it is `enabled`, so it survives reboots, but a
+rebuilt Pi without it leaves this app unable to start until it is back. That
+belongs in `bootstrap-device` if this sticks around.
+
+Using the service also forces the scheduler on (`ROUND_ROBIN`), which makes
+`network_group.activate()` illegal. Reverting to direct device access means
+restoring that call *and* solving the cgroup problem above.
 
 **No camera is attached.** `rpicam-hello --list-cameras` reports none; the
 `/dev/video*` nodes are the Pi's codec units, not a sensor. So input is uploaded

@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import queue
+import stat
 import threading
 import time
 from concurrent.futures import Future
@@ -31,6 +33,11 @@ from .postprocess import Detection, decode_nms
 
 log = logging.getLogger(__name__)
 
+# Where hailort_service listens. HailoRT has this compiled in, so it is not
+# configurable from here -- the pod spec has to mount the host's socket at
+# exactly this path.
+SERVICE_SOCKET = "/tmp/hailort_uds.sock"
+
 try:  # pragma: no cover -- present only in the image
     import hailo_platform as hpf
 
@@ -38,6 +45,34 @@ try:  # pragma: no cover -- present only in the image
 except Exception as exc:  # noqa: BLE001 -- any import failure is the same story here
     hpf = None
     HAILO_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+
+
+def check_service_socket(path: str = SERVICE_SOCKET) -> None:
+    """Fail with a diagnosable message if hailort_service is not reachable.
+
+    Without this, a missing socket surfaces as a bare HailoRT status code from
+    somewhere inside VDevice creation, which says nothing about which of the
+    two things went wrong. Both are one-line checks for whoever reads
+    /readyz.
+    """
+    try:
+        mode = os.stat(path).st_mode
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"hailort_service socket {path} is not present -- either "
+            "hailort.service is not running on this node "
+            "(systemctl status hailort.service), or the hostPath mount for it "
+            "is missing from the pod spec"
+        ) from None
+    except OSError as exc:
+        raise RuntimeError(f"cannot stat {path}: {exc}") from exc
+
+    if not stat.S_ISSOCK(mode):
+        raise RuntimeError(
+            f"{path} exists but is not a socket (mode {mode:o}) -- a hostPath "
+            "without `type: Socket` creates a directory when the host path is "
+            "absent, which is the usual cause"
+        )
 
 
 class EngineNotReady(RuntimeError):
@@ -188,10 +223,35 @@ class HailoEngine:
     def _serve(self) -> None:
         settings = self._settings
 
+        # Checked before touching HailoRT so the common deployment mistakes
+        # name themselves rather than arriving as a status code.
+        check_service_socket()
+
         params = hpf.VDevice.create_params()
-        # One model in one process: the multi-model scheduler buys nothing,
-        # and with it enabled `network_group.activate()` is rejected outright.
-        params.scheduling_algorithm = hpf.HailoSchedulingAlgorithm.NONE
+        # Go through hailort_service rather than opening /dev/hailo0.
+        #
+        # A container cannot open the device node directly under Kubernetes:
+        # a hostPath mount hands over the inode but adds no device-cgroup
+        # rule, so open() returns EPERM even though the node is mode 666.
+        # (`docker --device` adds that rule for you, which is why the same
+        # image works under plain Docker and the README used to claim this
+        # was enough.) The alternatives were a privileged device plugin or
+        # this.
+        #
+        # hailort_service already runs on the host as a systemd unit and owns
+        # the device, so the client side needs no device access at all --
+        # only its Unix socket, mounted in at the path HailoRT expects. It
+        # also means several pods can share one accelerator, which direct
+        # access cannot do.
+        params.multi_process_service = True
+        # The service requires the scheduler. That is not a free choice: with
+        # ROUND_ROBIN enabled, `network_group.activate()` becomes illegal and
+        # the scheduler activates network groups itself -- which is why the
+        # activate() call that used to wrap the inference loop is gone.
+        params.scheduling_algorithm = hpf.HailoSchedulingAlgorithm.ROUND_ROBIN
+        # Clients naming the same group share one underlying VDevice instead
+        # of each trying to claim the device for themselves.
+        params.group_id = "SHARED"
 
         with hpf.VDevice(params) as vdevice:
             hef = hpf.HEF(settings.hef_path)
@@ -199,7 +259,6 @@ class HailoEngine:
                 hef, interface=hpf.HailoStreamInterface.PCIe
             )
             network_group = vdevice.configure(hef, configure_params)[0]
-            network_group_params = network_group.create_params()
 
             input_info = hef.get_input_vstream_infos()[0]
             output_info = hef.get_output_vstream_infos()[0]
@@ -220,7 +279,7 @@ class HailoEngine:
                 self._model_name = network_group.name
 
             log.info(
-                "hailo device open: model=%s input=%dx%d output=%s hef=%s",
+                "hailo device open via hailort_service: model=%s input=%dx%d output=%s hef=%s",
                 network_group.name,
                 width,
                 height,
@@ -228,10 +287,8 @@ class HailoEngine:
                 settings.hef_path,
             )
 
-            with (
-                hpf.InferVStreams(network_group, input_params, output_params) as pipeline,
-                network_group.activate(network_group_params),
-            ):
+            # No activate() here -- see the scheduler note above.
+            with hpf.InferVStreams(network_group, input_params, output_params) as pipeline:
                 with self._lock:
                     # The device is open, so any error start() recorded while
                     # it was still opening is stale.
