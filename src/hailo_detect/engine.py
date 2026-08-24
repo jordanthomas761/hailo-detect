@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import queue
+import stat
 import threading
 import time
 from concurrent.futures import Future
@@ -31,6 +33,11 @@ from .postprocess import Detection, decode_nms
 
 log = logging.getLogger(__name__)
 
+# Where hailort_service listens. HailoRT has this compiled in, so it is not
+# configurable from here -- the pod spec has to mount the host's socket at
+# exactly this path.
+SERVICE_SOCKET = "/tmp/hailort_uds.sock"
+
 try:  # pragma: no cover -- present only in the image
     import hailo_platform as hpf
 
@@ -38,6 +45,34 @@ try:  # pragma: no cover -- present only in the image
 except Exception as exc:  # noqa: BLE001 -- any import failure is the same story here
     hpf = None
     HAILO_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+
+
+def check_service_socket(path: str = SERVICE_SOCKET) -> None:
+    """Fail with a diagnosable message if hailort_service is not reachable.
+
+    Without this, a missing socket surfaces as a bare HailoRT status code from
+    somewhere inside VDevice creation, which says nothing about which of the
+    two things went wrong. Both are one-line checks for whoever reads
+    /readyz.
+    """
+    try:
+        mode = os.stat(path).st_mode
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"hailort_service socket {path} is not present -- either "
+            "hailort.service is not running on this node "
+            "(systemctl status hailort.service), or the hostPath mount for it "
+            "is missing from the pod spec"
+        ) from None
+    except OSError as exc:
+        raise RuntimeError(f"cannot stat {path}: {exc}") from exc
+
+    if not stat.S_ISSOCK(mode):
+        raise RuntimeError(
+            f"{path} exists but is not a socket (mode {mode:o}) -- a hostPath "
+            "without `type: Socket` creates a directory when the host path is "
+            "absent, which is the usual cause"
+        )
 
 
 class EngineNotReady(RuntimeError):
@@ -187,6 +222,10 @@ class HailoEngine:
 
     def _serve(self) -> None:
         settings = self._settings
+
+        # Checked before touching HailoRT so the common deployment mistakes
+        # name themselves rather than arriving as a status code.
+        check_service_socket()
 
         params = hpf.VDevice.create_params()
         # Go through hailort_service rather than opening /dev/hailo0.
