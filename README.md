@@ -100,15 +100,21 @@ call equivalent are not:
 The Dockerfile sets the working form. The failure mode of the second is the
 nasty one: it looks exactly like the service not being configured at all.
 
-**A USB camera is attached, and it takes `/dev/video0`.** No CSI Camera
-Module — `v4l2-ctl --list-devices` reports a UVC device on `/dev/video0`,
+**A USB HDMI capture dongle is attached, and it takes `/dev/video0`.** No CSI
+Camera Module. `v4l2-ctl --list-devices` reports it as *"Nintendo Switch
+(usb-xhci-hcd.1-1)"* — a product string, not a console — on `/dev/video0`,
 `/dev/video1` (the metadata node UVC devices expose alongside capture) and
 `/dev/media3`. So the older note that the low-numbered `/dev/video*` nodes are
-the Pi's codec units does not hold while a USB camera is plugged in.
+the Pi's codec units does not hold while this is plugged in.
 
-**Node numbers are recycled, so do not hardcode them.** Two different devices
-— a Logitech MX Brio and an HDMI capture dongle — both enumerated as exactly
-`/dev/video0`, `/dev/video1`, `/dev/media3`. Reference a
+**It is a capture card, not a camera: no HDMI source, no frames.** It produces
+video only while something is plugged into its HDMI input and actively
+outputting. An empty stream is the expected state otherwise, not a fault — check
+the HDMI side before debugging anything here.
+
+**Node numbers are recycled, so do not hardcode them.** This dongle and a
+Logitech MX Brio, tried separately, both enumerated as exactly `/dev/video0`,
+`/dev/video1`, `/dev/media3`. Reference a
 `/dev/v4l/by-id/usb-...-video-index0` path instead, which is stable across
 replug and unambiguous about which device you meant.
 
@@ -117,11 +123,12 @@ replug and unambiguous about which device you meant.
 device cgroup. The pattern that worked for the accelerator applies unchanged:
 the host owns the hardware and publishes it, the container consumes a URL.
 `ustreamer` (MJPEG over HTTP) is the simpler publisher for a UVC device;
-MediaMTX with an ffmpeg `v4l2` input gives you RTSP. Pass
-`-input_format mjpeg` either way — otherwise ffmpeg negotiates raw YUYV and
-USB bandwidth caps you at a few frames a second — and pick a resolution
-explicitly, since a 4K camera will otherwise hand you far more pixels than a
-640x640 model wants.
+MediaMTX with an ffmpeg `v4l2` input gives you RTSP. Pass `-input_format mjpeg`
+either way — otherwise ffmpeg negotiates raw YUYV, and on a USB 2.0 capture
+chip that caps you at a few frames a second. Pick a resolution explicitly too:
+the dongle will happily hand over 1080p from an HDMI source, and the model
+wants 640x640, so downscaling on the host saves shipping pixels over USB and
+the network to throw them away.
 
 ## Models
 
