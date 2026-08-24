@@ -9,7 +9,7 @@ import tempfile
 
 import pytest
 
-from hailo_detect.engine import check_service_socket
+from hailo_detect.engine import check_service_socket, service_socket_path
 
 
 def test_missing_socket_names_both_likely_causes(tmp_path):
@@ -44,3 +44,22 @@ def test_a_real_socket_passes():
     finally:
         server.close()
         shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_service_address_forms_resolve_to_the_same_socket():
+    # The two spellings gRPC accepts both name one file; only `unix:/path`
+    # actually connects, but the pre-flight check has to locate either.
+    assert service_socket_path("unix:/tmp/hailort_uds.sock") == "/tmp/hailort_uds.sock"
+    assert service_socket_path("unix:///tmp/hailort_uds.sock") == "/tmp/hailort_uds.sock"
+
+
+def test_a_tcp_service_address_has_no_socket_to_check():
+    assert service_socket_path("localhost:50051") is None
+
+
+def test_a_tcp_address_skips_the_preflight_rather_than_failing(monkeypatch):
+    # Nothing local to stat, so the check must pass rather than invent a
+    # failure about a socket that was never meant to exist.
+    monkeypatch.setenv("HAILORT_SERVICE_ADDRESS", "1.2.3.4:9999")
+
+    check_service_socket()  # does not raise

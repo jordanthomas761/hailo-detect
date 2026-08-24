@@ -33,10 +33,30 @@ from .postprocess import Detection, decode_nms
 
 log = logging.getLogger(__name__)
 
-# Where hailort_service listens. HailoRT has this compiled in, so it is not
-# configurable from here -- the pod spec has to mount the host's socket at
-# exactly this path.
-SERVICE_SOCKET = "/tmp/hailort_uds.sock"
+# How to reach hailort_service.
+#
+# The address must be set, and its exact spelling matters more than it looks.
+# libhailort passes this straight to gRPC as a channel target:
+#
+#   unix:/tmp/hailort_uds.sock    works -- gRPC's relative-path UDS form
+#   unix:///tmp/hailort_uds.sock  silently falls back to opening /dev/hailo0
+#   /tmp/hailort_uds.sock         reaches gRPC but fails UNAVAILABLE (code 14)
+#
+# All three name the same file to a human. Only the first one connects. The
+# Dockerfile sets this; it is read here only to locate the socket for the
+# pre-flight check below, so the two cannot drift apart.
+SERVICE_ADDRESS_ENV = "HAILORT_SERVICE_ADDRESS"
+DEFAULT_SERVICE_ADDRESS = "unix:/tmp/hailort_uds.sock"
+
+
+def service_socket_path(address: str | None = None) -> str | None:
+    """The socket a HailoRT service address names, or None if it names a host."""
+    if address is None:
+        address = os.environ.get(SERVICE_ADDRESS_ENV) or DEFAULT_SERVICE_ADDRESS
+    if not address.startswith("unix:"):
+        return None  # a TCP address has no local socket to look for
+    path = address[len("unix:") :]
+    return "/" + path.lstrip("/") if path.strip("/") else None
 
 try:  # pragma: no cover -- present only in the image
     import hailo_platform as hpf
@@ -47,7 +67,7 @@ except Exception as exc:  # noqa: BLE001 -- any import failure is the same story
     HAILO_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 
-def check_service_socket(path: str = SERVICE_SOCKET) -> None:
+def check_service_socket(path: str | None = None) -> None:
     """Fail with a diagnosable message if hailort_service is not reachable.
 
     Without this, a missing socket surfaces as a bare HailoRT status code from
@@ -55,6 +75,11 @@ def check_service_socket(path: str = SERVICE_SOCKET) -> None:
     two things went wrong. Both are one-line checks for whoever reads
     /readyz.
     """
+    if path is None:
+        path = service_socket_path()
+    if path is None:
+        return  # a TCP service address: nothing local to check
+
     try:
         mode = os.stat(path).st_mode
     except FileNotFoundError:
