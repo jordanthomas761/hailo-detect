@@ -152,6 +152,10 @@ class StreamWorker:
         self._idle_since: float | None = None if settings.stream_on_demand else 0.0
 
         self._lock = threading.Lock()
+        # Bumped every time the source closes. A frame that was already in
+        # flight through the accelerator when that happened carries the old
+        # value and is dropped rather than published -- see _detect_frame.
+        self._session = 0
         self._connected = False
         self._last_error: str | None = None
         self._frames_read = 0
@@ -223,10 +227,21 @@ class StreamWorker:
         detections in memory would let /api/stream/snapshot.jpg and
         /api/status keep answering with a picture taken while someone was
         watching, minutes after the camera light went out.
+
+        Clearing is not enough on its own. Inference takes ~22ms and the
+        annotate-and-encode after it is not free, so when the source closes
+        there is very often a frame still in flight -- and it would land
+        *after* this ran, overwriting the sentinel and re-exposing exactly the
+        picture this is meant to drop. Bumping the session invalidates it.
         """
-        self._jpeg.put(None)
         with self._lock:
+            self._session += 1
             self._detections = []
+            # Both slots: the raw one so the processor starts no new work from
+            # a buffer captured while someone was watching, the jpeg one so
+            # nothing is left to serve.
+            self._raw.put(None)
+            self._jpeg.put(None)
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -259,7 +274,7 @@ class StreamWorker:
         with self._lock:
             self._last_error = message
             self._connected = False
-        log.warning("rtsp %s: %s", redact(self._url), message)
+        log.warning("stream %s: %s", redact(self._url), message)
 
     # -- reader ------------------------------------------------------------
 
@@ -306,7 +321,7 @@ class StreamWorker:
 
     def _stream_once(self, width: int, height: int) -> None:
         frame_bytes = width * height * 3
-        log.info("rtsp %s: connecting", redact(self._url))
+        log.info("stream %s: connecting", redact(self._url))
 
         process = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell
             self._ffmpeg_command(width, height),
@@ -321,7 +336,7 @@ class StreamWorker:
             assert process.stdout is not None
             while not self._stopping.is_set():
                 if not self._wanted():
-                    log.info("rtsp %s: no viewers, closing the source", redact(self._url))
+                    log.info("stream %s: no viewers, closing the source", redact(self._url))
                     return
                 buffer = process.stdout.read(frame_bytes)
                 if not buffer or len(buffer) < frame_bytes:
@@ -379,6 +394,9 @@ class StreamWorker:
                 self._note_error(f"detect: {type(exc).__name__}: {exc}")
 
     def _detect_frame(self, buffer: bytes) -> None:
+        with self._lock:
+            session = self._session
+
         width, height = self._engine.input_size
         # .copy() for two reasons: np.frombuffer over bytes is read-only and
         # HailoRT needs a writeable buffer, and the slot's bytes may be
@@ -389,8 +407,13 @@ class StreamWorker:
         # The frame is already letterboxed to the network input, so its own
         # pixel space *is* the space the boxes came back in -- no unmapping.
         annotated = draw_detections(Image.fromarray(frame), result.detections)
-        self._jpeg.put(encode_jpeg(annotated, self._settings.jpeg_quality))
+        jpeg = encode_jpeg(annotated, self._settings.jpeg_quality)
 
         with self._lock:
+            if session != self._session:
+                # The source closed while this frame was being processed.
+                # Publishing now would undo _forget_frames.
+                return
             self._frames_detected += 1
             self._detections = result.detections
+            self._jpeg.put(jpeg)

@@ -147,9 +147,13 @@ async def _mjpeg_frames(request: Request, worker: StreamWorker) -> AsyncIterator
     """Yield multipart JPEG parts for as long as the client stays connected."""
     seq = 0
     while not await request.is_disconnected():
-        # Each waiter parks a worker thread; anyio's default limiter (40) is
-        # the practical ceiling on concurrent viewers, which is far more than
-        # a LAN-only preview will ever see.
+        # Each waiter parks a thread from asyncio's default executor for up
+        # to the timeout below. That pool is min(32, cpu_count + 4) -- eight
+        # on this four-core Pi -- and it is NOT anyio's limiter, which only
+        # bounds anyio.to_thread.run_sync. It is shared with the upload path,
+        # so enough simultaneous viewers would make /api/detect queue behind
+        # them. Fine for a LAN-only preview; worth revisiting before this is
+        # ever exposed more widely.
         #
         # A None result is an idle tick: either no frame yet -- on demand, the
         # camera may still be starting -- or the source closed and dropped
