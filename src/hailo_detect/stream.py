@@ -145,6 +145,12 @@ class StreamWorker:
         )
         self._process: subprocess.Popen[bytes] | None = None
 
+        # Viewer accounting drives whether the source is open at all. The
+        # condition is what the reader thread parks on while nothing watches.
+        self._demand = threading.Condition()
+        self._viewers = 0
+        self._idle_since: float | None = None if settings.stream_on_demand else 0.0
+
         self._lock = threading.Lock()
         self._connected = False
         self._last_error: str | None = None
@@ -174,6 +180,54 @@ class StreamWorker:
 
     # -- state -------------------------------------------------------------
 
+    # -- demand ------------------------------------------------------------
+
+    def add_viewer(self) -> None:
+        """Register a viewer, opening the source if it was closed."""
+        with self._demand:
+            self._viewers += 1
+            self._idle_since = None
+            self._demand.notify_all()
+
+    def remove_viewer(self) -> None:
+        """Drop a viewer, starting the idle countdown if it was the last."""
+        with self._demand:
+            self._viewers = max(0, self._viewers - 1)
+            if self._viewers == 0:
+                self._idle_since = time.monotonic()
+            self._demand.notify_all()
+
+    def _wanted(self) -> bool:
+        """Should the source be open right now?"""
+        if not self._settings.stream_on_demand:
+            return True
+        with self._demand:
+            if self._viewers > 0:
+                return True
+            if self._idle_since is None:
+                return False
+            # Inside the grace period a reload keeps the source open rather
+            # than tearing it down and rebuilding it a second later.
+            return (time.monotonic() - self._idle_since) < self._settings.stream_idle_timeout_s
+
+    def _await_demand(self) -> None:
+        """Park until something wants frames, or the worker is stopping."""
+        while not self._stopping.is_set() and not self._wanted():
+            with self._demand:
+                self._demand.wait(1.0)
+
+    def _forget_frames(self) -> None:
+        """Drop everything captured, so nothing is served after the source closes.
+
+        This is the privacy half of on-demand. Leaving the last frame and its
+        detections in memory would let /api/stream/snapshot.jpg and
+        /api/status keep answering with a picture taken while someone was
+        watching, minutes after the camera light went out.
+        """
+        self._jpeg.put(None)
+        with self._lock:
+            self._detections = []
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -186,6 +240,9 @@ class StreamWorker:
                 "frames_detected": self._frames_detected,
                 "frames_dropped": self._frames_dropped,
                 "target_fps": self._settings.stream_fps,
+                "on_demand": self._settings.stream_on_demand,
+                "viewers": self._viewers,
+                "source_open": self._connected,
                 "detections": [d.as_dict() for d in self._detections],
             }
 
@@ -218,6 +275,12 @@ class StreamWorker:
     def _read_loop(self) -> None:
         backoff = self._settings.stream_reconnect_min_s
         while not self._stopping.is_set():
+            # Nothing is watching: do not open the source at all. With a
+            # publisher using MediaMTX's runOnDemand, not being a reader is
+            # what closes the camera.
+            self._await_demand()
+            if self._stopping.is_set():
+                return
             try:
                 width, height = self._engine.input_size
             except EngineNotReady:
@@ -257,6 +320,9 @@ class StreamWorker:
         try:
             assert process.stdout is not None
             while not self._stopping.is_set():
+                if not self._wanted():
+                    log.info("rtsp %s: no viewers, closing the source", redact(self._url))
+                    return
                 buffer = process.stdout.read(frame_bytes)
                 if not buffer or len(buffer) < frame_bytes:
                     break  # ffmpeg exited or the stream ended mid-frame
@@ -269,6 +335,8 @@ class StreamWorker:
             self._kill_ffmpeg()
             with self._lock:
                 self._connected = False
+            if not self._wanted():
+                self._forget_frames()
             stderr = b""
             if process.stderr is not None:
                 stderr = process.stderr.read() or b""
@@ -299,7 +367,7 @@ class StreamWorker:
                 continue
             buffer, seq = item
             if buffer is None:
-                continue
+                continue  # sentinel from stop() or _forget_frames()
             try:
                 self._detect_frame(buffer)
             except EngineBusy:

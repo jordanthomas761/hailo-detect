@@ -144,13 +144,27 @@ async function poll() {
       return;
     }
 
-    streamNote.textContent = stream.connected
-      ? `${stream.url} · ${stream.frames_detected} frames detected · ${stream.frames_dropped} dropped`
-      : `${stream.url} · reconnecting${stream.last_error ? ` — ${stream.last_error}` : "…"}`;
+    if (stream.connected) {
+      streamNote.textContent =
+        `${stream.url} · ${stream.frames_detected} frames detected · ${stream.frames_dropped} dropped`;
+    } else if (stream.on_demand && stream.viewers > 0) {
+      streamNote.textContent = `${stream.url} · opening the camera…`;
+    } else if (stream.on_demand) {
+      streamNote.textContent = `${stream.url} · camera closed until viewed`;
+    } else {
+      streamNote.textContent =
+        `${stream.url} · reconnecting${stream.last_error ? ` — ${stream.last_error}` : "…"}`;
+    }
 
-    // Only attach the MJPEG source once: resetting src restarts the
-    // multipart response and drops the connection mid-frame.
-    if (stream.connected && !streamStarted) {
+    // Attached as soon as the stream is configured, NOT once it reports
+    // connected. On demand the camera stays closed until something watches
+    // the MJPEG endpoint -- so waiting for `connected` here would deadlock:
+    // this <img> is the viewer whose arrival opens the camera.
+    //
+    // Only ever attached once. Resetting src restarts the multipart response,
+    // which drops the connection mid-frame and, on demand, counts as a viewer
+    // leaving and arriving again.
+    if (!streamStarted) {
       streamImage.src = "/api/stream/mjpeg";
       streamImage.hidden = false;
       streamStarted = true;

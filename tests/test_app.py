@@ -189,3 +189,64 @@ def test_index_404s_when_the_ui_assets_are_missing(monkeypatch, engines, tmp_pat
 def test_stream_endpoints_404_without_an_rtsp_url(client):
     assert client.get("/api/stream/snapshot.jpg").status_code == 404
     assert client.get("/api/status").json()["stream"] == {"enabled": False}
+
+
+class StubWorker:
+    """Stands in for StreamWorker; records whether the camera was asked for."""
+
+    def __init__(self, settings: Settings, engine) -> None:
+        self.viewers = 0
+        self.peak_viewers = 0
+        self.jpeg: bytes | None = None
+
+    def start(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+    def add_viewer(self) -> None:
+        self.viewers += 1
+        self.peak_viewers = max(self.peak_viewers, self.viewers)
+
+    def remove_viewer(self) -> None:
+        self.viewers -= 1
+
+    def latest_jpeg(self) -> tuple[bytes | None, int]:
+        return self.jpeg, 0
+
+    def status(self) -> dict:
+        return {"enabled": True, "viewers": self.viewers, "detections": []}
+
+
+@pytest.fixture
+def streaming_client(monkeypatch, engines):
+    workers: list[StubWorker] = []
+
+    def factory(settings: Settings, engine) -> StubWorker:
+        stub = StubWorker(settings, engine)
+        workers.append(stub)
+        return stub
+
+    monkeypatch.setattr(app_module, "StreamWorker", factory)
+    settings = Settings(stream_url="http://cam.local:8080/stream")
+    with TestClient(app_module.create_app(settings)) as test_client:
+        test_client.worker = workers[0]  # type: ignore[attr-defined]
+        yield test_client
+
+
+def test_snapshot_never_opens_the_camera(streaming_client):
+    # A snapshot endpoint that switched the camera on would be the obvious way
+    # to defeat on-demand, so it must read only what is already there.
+    response = streaming_client.get("/api/stream/snapshot.jpg")
+
+    assert response.status_code == 503
+    assert "only open while the stream is being viewed" in response.json()["detail"]
+    assert streaming_client.worker.peak_viewers == 0
+
+
+def test_snapshot_serves_a_frame_when_one_is_already_there(streaming_client):
+    streaming_client.worker.jpeg = b"\xff\xd8already-captured"
+
+    response = streaming_client.get("/api/stream/snapshot.jpg")
+
+    assert response.status_code == 200
+    assert streaming_client.worker.peak_viewers == 0
