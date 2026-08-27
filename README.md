@@ -100,28 +100,64 @@ call equivalent are not:
 The Dockerfile sets the working form. The failure mode of the second is the
 nasty one: it looks exactly like the service not being configured at all.
 
-**A USB camera is attached, and it takes `/dev/video0`.** No CSI Camera
-Module — `v4l2-ctl --list-devices` reports a UVC device on `/dev/video0`,
-`/dev/video1` (the metadata node UVC devices expose alongside capture) and
-`/dev/media3`. So the older note that the low-numbered `/dev/video*` nodes are
-the Pi's codec units does not hold while a USB camera is plugged in.
+**A USB webcam is attached, and it takes `/dev/video0`.** No CSI Camera
+Module. It is a Nintendo-branded UVC camera — `usb-Nintendo_Co.__Ltd._Camera_Device`
+— on `/dev/video0`, `/dev/video1` (the metadata node UVC devices expose
+alongside capture) and `/dev/media3`. So the older note that the low-numbered
+`/dev/video*` nodes are the Pi's codec units does not hold while this is
+plugged in.
 
-**Node numbers are recycled, so do not hardcode them.** Two different devices
-— a Logitech MX Brio and an HDMI capture dongle — both enumerated as exactly
-`/dev/video0`, `/dev/video1`, `/dev/media3`. Reference a
-`/dev/v4l/by-id/usb-...-video-index0` path instead, which is stable across
-replug and unambiguous about which device you meant.
+**Node numbers are recycled, so do not hardcode them.** This camera and a
+Logitech MX Brio, tried separately, both enumerated as exactly `/dev/video0`,
+`/dev/video1`, `/dev/media3`. Use the stable path:
 
-**A container cannot read it, for the same reason it cannot read
-`/dev/hailo0`.** It is a device node, so `hostPath` gives `EPERM` from the
-device cgroup. The pattern that worked for the accelerator applies unchanged:
-the host owns the hardware and publishes it, the container consumes a URL.
+    /dev/v4l/by-id/usb-Nintendo_Co.__Ltd._Camera_Device_000000000001-video-index0
+
+**MJPEG, not YUYV, and this is measured rather than assumed.** From
+`v4l2-ctl --list-formats-ext`:
+
+| resolution | YUYV | MJPG |
+|---|---|---|
+| 1920x1080 | not offered | 30 fps |
+| 1280x720 | 10 fps | 30 fps |
+| 640x480 | 30 fps | 60 fps |
+
+YUYV at 720p caps at 10 fps because uncompressed frames saturate USB 2.0.
+Whatever publishes this must ask for MJPEG explicitly — ffmpeg negotiates YUYV
+by default, which is how you end up with a 10 fps stream and no obvious reason
+for it.
+
+**A container cannot read it, and this is measured rather than assumed.** Two
+layers block it, and they surface as different errnos — which matters, because
+the first one looks fixable and is not the real problem:
+
+    mode 0o660 root:video(44)
+    uid 10001, groups [999]      -> EACCES (13)   file permissions
+    uid 10001, groups [44, 999]  -> EPERM  (1)    device cgroup
+
+`supplementalGroups: [44]` clears the permission bits and reveals the same
+`EPERM` that `/dev/hailo0` gives. The camera differs from the accelerator
+here: `/dev/hailo0` is mode 666, so it hit the cgroup immediately, while the
+camera fails on group membership first. Past both lies `privileged` or a
+device plugin, which is itself a privileged DaemonSet.
+
+The pattern that worked for the accelerator applies unchanged: the host owns
+the hardware and publishes it, the container consumes a URL. For a privacy
+motivation that is arguably better architecture than a workaround — the
+process that opens the camera stays small and host-local, while the
+network-facing component (uploads, the MJPEG endpoint, the whole HTTP surface)
+stays unprivileged in a container. Handing that component effectively-root on
+the node to save one host process is a poor trade when the point is
+controlling when the camera is on.
 `ustreamer` (MJPEG over HTTP) is the simpler publisher for a UVC device;
-MediaMTX with an ffmpeg `v4l2` input gives you RTSP. Pass
-`-input_format mjpeg` either way — otherwise ffmpeg negotiates raw YUYV and
-USB bandwidth caps you at a few frames a second — and pick a resolution
-explicitly, since a 4K camera will otherwise hand you far more pixels than a
-640x640 model wants.
+MediaMTX with an ffmpeg `v4l2` input gives you RTSP instead.
+
+Ask for a resolution explicitly. The model input is 640x640, and the service
+letterboxes to fit, so aspect ratio decides how much of that square carries
+picture: 1280x720 fills 640x360 of it (56%), while 640x480 fills 640x480
+(75%). 720p is the better trade anyway — the extra detail survives the
+downscale, and 1080p only spends USB bandwidth on pixels that are about to be
+thrown away.
 
 ## Models
 
@@ -191,6 +227,8 @@ All environment, all optional.
 | `STREAM_URL` | *unset* | Any URL ffmpeg can read. Unset means the stream half stays dormant |
 | `RTSP_TRANSPORT` | `tcp` | `tcp` or `udp`, and passed only for `rtsp://` URLs |
 | `STREAM_FPS` | `5` | What ffmpeg is asked for, not what the source sustains |
+| `STREAM_ON_DEMAND` | `true` | Open the source only while the MJPEG endpoint is watched |
+| `STREAM_IDLE_TIMEOUT_S` | `30` | Grace period after the last viewer leaves |
 | `LOG_LEVEL` | `INFO` | |
 
 `STREAM_URL` is not RTSP-specific. The RTSP-only ffmpeg flags are passed only
@@ -201,6 +239,48 @@ before. `RTSP_URL` and `RTSP_FPS` are still accepted as the older names.
 If the URL carries credentials, deliver it as a SealedSecret and load it with
 `envFrom` rather than as a literal in the Deployment — and note the service
 redacts the userinfo before the URL reaches a log line or `/api/status`.
+
+## On-demand capture
+
+`STREAM_ON_DEMAND` is on by default, and it exists for privacy rather than for
+load — at 5 fps the Pi is nowhere near saturated. While nothing is watching
+`/api/stream/mjpeg` the app is not a reader at all: no ffmpeg, no inference,
+nothing holding the source open.
+
+**That only turns the camera off if the publisher is also on demand**, and this
+is the part that is easy to get backwards. A publisher capturing
+unconditionally keeps the device open no matter what this app does. MediaMTX's
+`runOnDemand` is the counterpart — it starts the capture command when a reader
+appears and SIGINTs it once none remain:
+
+```yaml
+paths:
+  cam:
+    runOnDemand: >
+      ffmpeg -f v4l2 -input_format mjpeg -framerate 15 -video_size 1280x720
+      -i /dev/v4l/by-id/usb-Nintendo_Co.__Ltd._Camera_Device_000000000001-video-index0
+      -c copy -f rtsp rtsp://localhost:$RTSP_PORT/$MTX_PATH
+    runOnDemandCloseAfter: 30s
+```
+
+The dependency runs both ways: this app being on demand is what makes
+`runOnDemand` work at all, because a permanently connected reader would hold
+the camera open forever and make that setting do nothing.
+
+Two deliberate details:
+
+- **Closing the source forgets what it captured.** The last frame and its
+  detections are dropped, so `/api/stream/snapshot.jpg` and `/api/status`
+  cannot keep serving a picture taken while someone was watching, minutes
+  after the indicator light went out.
+- **`/api/stream/snapshot.jpg` never opens the camera.** It reads only what is
+  already there and 503s otherwise. A snapshot endpoint that switched the
+  camera on would be the obvious way to defeat all of this.
+
+First view costs a few seconds: the publisher has to start (MediaMTX holds
+readers up to `runOnDemandStartTimeout`, default 10s) and this app's reconnect
+backoff starts at 1s. Fine for a page you glance at; wrong for motion
+alerting, which is always-on by definition — set `STREAM_ON_DEMAND=false`.
 
 ## Working on it without a Hailo
 
@@ -306,9 +386,13 @@ Still open:
 - **No detection has been run on a real image.** The inference above was on
   random noise, which correctly produced nothing. Boxes on a real photo, and
   whether the labels line up with COCO's class order, are unverified.
-- **The stream path has never run.** Nothing has fed it a URL, so the reader
-  loop, the reconnect backoff and the MJPEG endpoint are all unexercised. A
-  camera is attached now, but nothing publishes it yet.
+- **On-demand capture has not run on the hardware.** The demand gate is unit
+  tested, but the full loop — viewer arrives, publisher starts, camera opens,
+  viewer leaves, camera closes — has never been exercised against a real
+  `runOnDemand` publisher.
+- **Nothing authenticates the stream.** Anyone who can reach
+  `hailo.jordanthomas.site` on the LAN can watch the camera. On-demand controls
+  *when* the camera is on, not *who* may look through it.
 - **Nothing is measured under load.** The queue depth, the timeout and the
   memory request are all estimates; 25.4 ms for one frame is not a throughput
   figure.

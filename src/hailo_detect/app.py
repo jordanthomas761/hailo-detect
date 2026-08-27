@@ -143,6 +143,32 @@ async def _detect_upload(
     return detections, result, source
 
 
+async def _mjpeg_frames(request: Request, worker: StreamWorker) -> AsyncIterator[bytes]:
+    """Yield multipart JPEG parts for as long as the client stays connected."""
+    seq = 0
+    while not await request.is_disconnected():
+        # Each waiter parks a thread from asyncio's default executor for up
+        # to the timeout below. That pool is min(32, cpu_count + 4) -- eight
+        # on this four-core Pi -- and it is NOT anyio's limiter, which only
+        # bounds anyio.to_thread.run_sync. It is shared with the upload path,
+        # so enough simultaneous viewers would make /api/detect queue behind
+        # them. Fine for a LAN-only preview; worth revisiting before this is
+        # ever exposed more widely.
+        #
+        # A None result is an idle tick: either no frame yet -- on demand, the
+        # camera may still be starting -- or the source closed and dropped
+        # what it had. Loop and re-check the client either way.
+        item = await asyncio.to_thread(worker.wait_for_jpeg, seq, 5.0)
+        if item is None:
+            continue
+        jpeg, seq = item
+        yield (
+            f"--{MJPEG_BOUNDARY}\r\n"
+            f"Content-Type: image/jpeg\r\n"
+            f"Content-Length: {len(jpeg)}\r\n\r\n"
+        ).encode() + jpeg + b"\r\n"
+
+
 def _register_routes(app: FastAPI) -> None:
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
@@ -210,9 +236,19 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.get("/api/stream/snapshot.jpg", response_class=Response, include_in_schema=False)
     async def snapshot(request: Request) -> Response:
+        # Deliberately does not register a viewer, so hitting this cannot open
+        # the camera. It serves a frame only while something else is already
+        # watching -- a snapshot endpoint that switched the camera on would be
+        # the obvious way to defeat on-demand.
         jpeg, _ = _stream(request).latest_jpeg()
         if jpeg is None:
-            raise HTTPException(status_code=503, detail="no frame from the stream yet")
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "no frame available -- the camera is only open while the "
+                    "stream is being viewed"
+                ),
+            )
         return Response(content=jpeg, media_type="image/jpeg")
 
     @app.get("/api/stream/mjpeg", include_in_schema=False)
@@ -220,20 +256,15 @@ def _register_routes(app: FastAPI) -> None:
         worker = _stream(request)
 
         async def frames() -> AsyncIterator[bytes]:
-            seq = 0
-            while not await request.is_disconnected():
-                # Each waiter parks a worker thread; anyio's default limiter
-                # (40) is the practical ceiling on concurrent viewers, which
-                # is far more than a LAN-only preview will ever see.
-                item = await asyncio.to_thread(worker.wait_for_jpeg, seq, 5.0)
-                if item is None:
-                    continue  # idle tick -- loop back and re-check the client
-                jpeg, seq = item
-                yield (
-                    f"--{MJPEG_BOUNDARY}\r\n"
-                    f"Content-Type: image/jpeg\r\n"
-                    f"Content-Length: {len(jpeg)}\r\n\r\n"
-                ).encode() + jpeg + b"\r\n"
+            # Registered inside the generator, not around it: this is the only
+            # place guaranteed to pair with the finally below, so a viewer
+            # cannot be leaked and leave the camera open.
+            worker.add_viewer()
+            try:
+                async for chunk in _mjpeg_frames(request, worker):
+                    yield chunk
+            finally:
+                worker.remove_viewer()
 
         return StreamingResponse(
             frames(),

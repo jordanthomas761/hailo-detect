@@ -29,6 +29,17 @@ def _int(name: str, default: int) -> int:
         raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
 
 
+def _bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean, got {raw!r}")
+
+
 def _float(name: str, default: float) -> float:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -74,6 +85,16 @@ class Settings:
     stream_reconnect_min_s: float = 1.0
     stream_reconnect_max_s: float = 30.0
 
+    # On demand by default, for privacy rather than for load. While nothing is
+    # watching the MJPEG endpoint the app is not a reader, which is what lets
+    # a publisher configured with MediaMTX's runOnDemand close the camera --
+    # device released, indicator light off. An always-connected reader would
+    # hold it open forever and make that setting useless.
+    stream_on_demand: bool = True
+    # Grace period after the last viewer leaves. A page reload should not tear
+    # the camera down and bring it straight back up.
+    stream_idle_timeout_s: float = 30.0
+
     @classmethod
     def from_env(cls) -> Settings:
         transport = _str("RTSP_TRANSPORT", "tcp")
@@ -94,4 +115,6 @@ class Settings:
             stream_url=_opt_str("STREAM_URL") or _opt_str("RTSP_URL"),
             rtsp_transport=transport,
             stream_fps=_float("STREAM_FPS", _float("RTSP_FPS", cls.stream_fps)),
+            stream_on_demand=_bool("STREAM_ON_DEMAND", cls.stream_on_demand),
+            stream_idle_timeout_s=_float("STREAM_IDLE_TIMEOUT_S", cls.stream_idle_timeout_s),
         )

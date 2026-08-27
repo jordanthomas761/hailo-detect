@@ -57,3 +57,142 @@ def test_credentials_are_stripped_before_logging():
 
 def test_redact_survives_a_url_it_cannot_parse():
     assert redact("not a url") == "<invalid rtsp url>"
+
+
+class _DummyEngine:
+    """StreamWorker only touches the engine from its threads, which never start."""
+
+    @property
+    def input_size(self) -> tuple[int, int]:
+        return (640, 640)
+
+
+def worker(engine=None, **overrides):
+    from hailo_detect.config import Settings
+    from hailo_detect.stream import StreamWorker
+
+    settings = Settings(stream_url="http://cam.local:8080/stream", **overrides)
+    return StreamWorker(settings, engine or _DummyEngine())  # type: ignore[arg-type]
+
+
+def test_on_demand_keeps_the_source_closed_until_something_watches():
+    w = worker()
+
+    assert w._wanted() is False
+
+    w.add_viewer()
+    assert w._wanted() is True
+
+
+def test_the_last_viewer_leaving_starts_a_grace_period():
+    # A page reload should not close the camera and reopen it a second later.
+    w = worker(stream_idle_timeout_s=60.0)
+    w.add_viewer()
+
+    w.remove_viewer()
+
+    assert w._wanted() is True
+
+
+def test_the_source_closes_once_the_grace_period_expires():
+    w = worker(stream_idle_timeout_s=0.0)
+    w.add_viewer()
+
+    w.remove_viewer()
+
+    assert w._wanted() is False
+
+
+def test_concurrent_viewers_are_counted_not_toggled():
+    w = worker(stream_idle_timeout_s=0.0)
+    w.add_viewer()
+    w.add_viewer()
+
+    w.remove_viewer()
+
+    # One viewer left, so the camera must stay open.
+    assert w._wanted() is True
+    w.remove_viewer()
+    assert w._wanted() is False
+
+
+def test_always_on_never_closes_the_source():
+    w = worker(stream_on_demand=False)
+
+    assert w._wanted() is True
+    w.add_viewer()
+    w.remove_viewer()
+    assert w._wanted() is True
+
+
+def test_closing_the_source_forgets_what_it_captured():
+    # The privacy half: a frame taken while someone watched must not still be
+    # served from /api/stream/snapshot.jpg after the camera light goes out.
+    w = worker()
+    w._jpeg.put(b"\xff\xd8jpeg-bytes")
+    w._detections = [object()]  # type: ignore[list-item]
+
+    w._forget_frames()
+
+    assert w.latest_jpeg()[0] is None
+    assert w.status()["detections"] == []
+
+
+def test_a_frame_still_in_flight_when_the_source_closes_is_not_published():
+    """The race the clear-on-close guarantee lives or dies on.
+
+    Inference is ~22ms and the annotate-and-encode after it is not free, so a
+    frame is very often mid-flight when the last viewer leaves. Without the
+    session check it lands *after* the source closed, overwrites the sentinel,
+    and re-exposes the picture that closing was supposed to drop.
+    """
+    from hailo_detect.engine import InferenceResult
+    from hailo_detect.postprocess import Detection
+
+    detection = Detection(class_id=0, label="person", score=0.9, x0=0.1, y0=0.1, x1=0.4, y1=0.4)
+
+    class ClosingMidInference:
+        """Stands in for the source closing while this frame is being processed."""
+
+        def __init__(self) -> None:
+            self.worker: object | None = None
+
+        @property
+        def input_size(self) -> tuple[int, int]:
+            return (8, 8)
+
+        def infer(self, frame):
+            self.worker._forget_frames()  # type: ignore[union-attr]
+            return InferenceResult(detections=[detection], duration_ms=1.0)
+
+    engine = ClosingMidInference()
+    w = worker(engine=engine)
+    engine.worker = w
+
+    w._detect_frame(b"\x00" * (8 * 8 * 3))
+
+    assert w.latest_jpeg()[0] is None
+    assert w.status()["detections"] == []
+    assert w.status()["frames_detected"] == 0
+
+
+def test_a_frame_that_finishes_before_the_source_closes_is_published():
+    from hailo_detect.engine import InferenceResult
+    from hailo_detect.postprocess import Detection
+
+    detection = Detection(class_id=0, label="person", score=0.9, x0=0.1, y0=0.1, x1=0.4, y1=0.4)
+
+    class Quiet:
+        @property
+        def input_size(self) -> tuple[int, int]:
+            return (8, 8)
+
+        def infer(self, frame):
+            return InferenceResult(detections=[detection], duration_ms=1.0)
+
+    w = worker(engine=Quiet())
+
+    w._detect_frame(b"\x00" * (8 * 8 * 3))
+
+    assert w.latest_jpeg()[0] is not None
+    assert [d["label"] for d in w.status()["detections"]] == ["person"]

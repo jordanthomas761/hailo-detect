@@ -145,7 +145,17 @@ class StreamWorker:
         )
         self._process: subprocess.Popen[bytes] | None = None
 
+        # Viewer accounting drives whether the source is open at all. The
+        # condition is what the reader thread parks on while nothing watches.
+        self._demand = threading.Condition()
+        self._viewers = 0
+        self._idle_since: float | None = None if settings.stream_on_demand else 0.0
+
         self._lock = threading.Lock()
+        # Bumped every time the source closes. A frame that was already in
+        # flight through the accelerator when that happened carries the old
+        # value and is dropped rather than published -- see _detect_frame.
+        self._session = 0
         self._connected = False
         self._last_error: str | None = None
         self._frames_read = 0
@@ -174,6 +184,65 @@ class StreamWorker:
 
     # -- state -------------------------------------------------------------
 
+    # -- demand ------------------------------------------------------------
+
+    def add_viewer(self) -> None:
+        """Register a viewer, opening the source if it was closed."""
+        with self._demand:
+            self._viewers += 1
+            self._idle_since = None
+            self._demand.notify_all()
+
+    def remove_viewer(self) -> None:
+        """Drop a viewer, starting the idle countdown if it was the last."""
+        with self._demand:
+            self._viewers = max(0, self._viewers - 1)
+            if self._viewers == 0:
+                self._idle_since = time.monotonic()
+            self._demand.notify_all()
+
+    def _wanted(self) -> bool:
+        """Should the source be open right now?"""
+        if not self._settings.stream_on_demand:
+            return True
+        with self._demand:
+            if self._viewers > 0:
+                return True
+            if self._idle_since is None:
+                return False
+            # Inside the grace period a reload keeps the source open rather
+            # than tearing it down and rebuilding it a second later.
+            return (time.monotonic() - self._idle_since) < self._settings.stream_idle_timeout_s
+
+    def _await_demand(self) -> None:
+        """Park until something wants frames, or the worker is stopping."""
+        while not self._stopping.is_set() and not self._wanted():
+            with self._demand:
+                self._demand.wait(1.0)
+
+    def _forget_frames(self) -> None:
+        """Drop everything captured, so nothing is served after the source closes.
+
+        This is the privacy half of on-demand. Leaving the last frame and its
+        detections in memory would let /api/stream/snapshot.jpg and
+        /api/status keep answering with a picture taken while someone was
+        watching, minutes after the camera light went out.
+
+        Clearing is not enough on its own. Inference takes ~22ms and the
+        annotate-and-encode after it is not free, so when the source closes
+        there is very often a frame still in flight -- and it would land
+        *after* this ran, overwriting the sentinel and re-exposing exactly the
+        picture this is meant to drop. Bumping the session invalidates it.
+        """
+        with self._lock:
+            self._session += 1
+            self._detections = []
+            # Both slots: the raw one so the processor starts no new work from
+            # a buffer captured while someone was watching, the jpeg one so
+            # nothing is left to serve.
+            self._raw.put(None)
+            self._jpeg.put(None)
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -186,6 +255,9 @@ class StreamWorker:
                 "frames_detected": self._frames_detected,
                 "frames_dropped": self._frames_dropped,
                 "target_fps": self._settings.stream_fps,
+                "on_demand": self._settings.stream_on_demand,
+                "viewers": self._viewers,
+                "source_open": self._connected,
                 "detections": [d.as_dict() for d in self._detections],
             }
 
@@ -202,7 +274,7 @@ class StreamWorker:
         with self._lock:
             self._last_error = message
             self._connected = False
-        log.warning("rtsp %s: %s", redact(self._url), message)
+        log.warning("stream %s: %s", redact(self._url), message)
 
     # -- reader ------------------------------------------------------------
 
@@ -218,6 +290,12 @@ class StreamWorker:
     def _read_loop(self) -> None:
         backoff = self._settings.stream_reconnect_min_s
         while not self._stopping.is_set():
+            # Nothing is watching: do not open the source at all. With a
+            # publisher using MediaMTX's runOnDemand, not being a reader is
+            # what closes the camera.
+            self._await_demand()
+            if self._stopping.is_set():
+                return
             try:
                 width, height = self._engine.input_size
             except EngineNotReady:
@@ -243,7 +321,7 @@ class StreamWorker:
 
     def _stream_once(self, width: int, height: int) -> None:
         frame_bytes = width * height * 3
-        log.info("rtsp %s: connecting", redact(self._url))
+        log.info("stream %s: connecting", redact(self._url))
 
         process = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell
             self._ffmpeg_command(width, height),
@@ -257,6 +335,9 @@ class StreamWorker:
         try:
             assert process.stdout is not None
             while not self._stopping.is_set():
+                if not self._wanted():
+                    log.info("stream %s: no viewers, closing the source", redact(self._url))
+                    return
                 buffer = process.stdout.read(frame_bytes)
                 if not buffer or len(buffer) < frame_bytes:
                     break  # ffmpeg exited or the stream ended mid-frame
@@ -269,6 +350,8 @@ class StreamWorker:
             self._kill_ffmpeg()
             with self._lock:
                 self._connected = False
+            if not self._wanted():
+                self._forget_frames()
             stderr = b""
             if process.stderr is not None:
                 stderr = process.stderr.read() or b""
@@ -299,7 +382,7 @@ class StreamWorker:
                 continue
             buffer, seq = item
             if buffer is None:
-                continue
+                continue  # sentinel from stop() or _forget_frames()
             try:
                 self._detect_frame(buffer)
             except EngineBusy:
@@ -311,6 +394,9 @@ class StreamWorker:
                 self._note_error(f"detect: {type(exc).__name__}: {exc}")
 
     def _detect_frame(self, buffer: bytes) -> None:
+        with self._lock:
+            session = self._session
+
         width, height = self._engine.input_size
         # .copy() for two reasons: np.frombuffer over bytes is read-only and
         # HailoRT needs a writeable buffer, and the slot's bytes may be
@@ -321,8 +407,13 @@ class StreamWorker:
         # The frame is already letterboxed to the network input, so its own
         # pixel space *is* the space the boxes came back in -- no unmapping.
         annotated = draw_detections(Image.fromarray(frame), result.detections)
-        self._jpeg.put(encode_jpeg(annotated, self._settings.jpeg_quality))
+        jpeg = encode_jpeg(annotated, self._settings.jpeg_quality)
 
         with self._lock:
+            if session != self._session:
+                # The source closed while this frame was being processed.
+                # Publishing now would undo _forget_frames.
+                return
             self._frames_detected += 1
             self._detections = result.detections
+            self._jpeg.put(jpeg)
