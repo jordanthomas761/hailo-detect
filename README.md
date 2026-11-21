@@ -306,16 +306,16 @@ then build and push `registry.jordanthomas.site/hailo-detect:<short-sha>`. No
 `:latest` and no branch tag — `policy/workloads.rego` in homelab-infra rejects
 both, and a floating tag leaves Argo nothing to roll back to.
 
-The workflow needs two things that do not exist yet:
+The workflow needs two things from outside this repo:
 
-1. **A repo-scoped ARC scale set**, `apps/arc-runners-hailo-detect/` in
-   homelab-infra, with `runnerScaleSetName: hailo-detect-runner` — that name
-   is the `runs-on:` label here, and the two must be changed together. Copy
-   `apps/arc-runners-homelab-infra/`, which already pins runners to worker
-   nodes.
-2. **`REGISTRY_USERNAME` / `REGISTRY_PASSWORD`** repo secrets — the zot
-   htpasswd account from `apps/registry/README.md`. Pull is anonymous; only
-   the push needs them.
+1. **Access to the biwbass org-wide ARC scale set**, `apps/arc-runners-org/`
+   in homelab-infra, whose `runnerScaleSetName: biwbass` is the `runs-on:`
+   label here. It runs `dind` and pins runners to worker nodes, so the image
+   build never lands on the control plane. This repo has to be granted access
+   in the org's "Raspberry Pi" runner group, or jobs queue forever.
+2. **`REGISTRY_USERNAME` / `REGISTRY_PASSWORD`** org secrets scoped to this
+   repo — the zot htpasswd account from `apps/registry/README.md`. Pull is
+   anonymous; only the push needs them.
 
 Locally, on an arm64 machine:
 
